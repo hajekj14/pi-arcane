@@ -40,6 +40,17 @@ export interface CollectOptions {
 	 * that keep a `follow=false` stream open instead of closing it.
 	 */
 	idleMs?: number;
+	/**
+	 * Abort when `Sec-WebSocket-Accept` does not match the key we sent.
+	 *
+	 * Off by default. Arcane sits behind a proxy that re-keys the handshake and
+	 * returns an accept token derived from its own key, so a strict check
+	 * rejects a connection that then streams perfectly well. The 101 status and
+	 * the `Upgrade: websocket` header already establish that the peer spoke
+	 * WebSocket; the token adds little against a server we authenticated to over
+	 * TLS with an API key.
+	 */
+	requireAcceptMatch?: boolean;
 	signal?: AbortSignal;
 }
 
@@ -49,6 +60,8 @@ export interface CollectResult {
 	truncated: boolean;
 	/** Close code, when the server closed cleanly. */
 	closeCode?: number;
+	/** True when the handshake token did not match (see `requireAcceptMatch`). */
+	acceptMismatch?: boolean;
 }
 
 export class WebSocketError extends Error {
@@ -152,6 +165,7 @@ export function collectWebSocketMessages(
 		maxMessages = 5000,
 		maxBytes = 2 * 1024 * 1024,
 		idleMs = 2500,
+		requireAcceptMatch = false,
 		signal,
 	} = options;
 
@@ -169,6 +183,7 @@ export function collectWebSocketMessages(
 		let bytes = 0;
 		let truncated = false;
 		let closeCode: number | undefined;
+		let acceptMismatch = false;
 		let settled = false;
 		let socket: Duplex | undefined;
 		let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -189,7 +204,7 @@ export function collectWebSocketMessages(
 			if (settled) return;
 			settled = true;
 			cleanup();
-			resolve({ messages, truncated, closeCode });
+			resolve({ messages, truncated, closeCode, acceptMismatch });
 		};
 
 		const fail = (error: Error) => {
@@ -257,8 +272,13 @@ export function collectWebSocketMessages(
 		req.on("upgrade", (res: IncomingMessage, upgraded: Duplex, head: Buffer) => {
 			const accept = res.headers["sec-websocket-accept"];
 			if (accept !== expectedAccept) {
-				fail(new WebSocketError("WebSocket handshake returned an invalid Sec-WebSocket-Accept"));
-				return;
+				acceptMismatch = true;
+				if (requireAcceptMatch) {
+					fail(
+						new WebSocketError("WebSocket handshake returned an invalid Sec-WebSocket-Accept"),
+					);
+					return;
+				}
 			}
 
 			socket = upgraded;

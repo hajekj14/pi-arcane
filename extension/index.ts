@@ -8,11 +8,13 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
+import { runDestroy } from "./commands/destroy.ts";
 import { runSetup } from "./commands/setup.ts";
 import { runStatus, STATUS_ENTRY_TYPE, type StatusEntryData } from "./commands/status.ts";
 import { resetRuntime } from "./runtime.ts";
 import { createBuildTool } from "./tools/build.ts";
 import { createDeployTool } from "./tools/deploy.ts";
+import { createDestroyTool } from "./tools/destroy.ts";
 import { createListTool } from "./tools/list.ts";
 import { createLogsTool } from "./tools/logs.ts";
 import { createStatusTool } from "./tools/status.ts";
@@ -23,6 +25,7 @@ export type { ArcaneStatusInput } from "./tools/status.ts";
 export type { ArcaneBuildInput } from "./tools/build.ts";
 export type { ArcaneLogsInput } from "./tools/logs.ts";
 export type { ArcaneListInput } from "./tools/list.ts";
+export type { ArcaneDestroyInput } from "./tools/destroy.ts";
 
 export default function arcaneExtension(pi: ExtensionAPI): void {
 	// --- Tools --------------------------------------------------------------
@@ -31,12 +34,20 @@ export default function arcaneExtension(pi: ExtensionAPI): void {
 	pi.registerTool(createBuildTool());
 	pi.registerTool(createLogsTool());
 	pi.registerTool(createListTool());
+	pi.registerTool(createDestroyTool());
 
 	// --- Commands -----------------------------------------------------------
 	pi.registerCommand("arcane-setup", {
 		description: "Configure the Arcane host, API key and target environment",
 		handler: async (args, ctx) => {
 			await runSetup(args, ctx);
+		},
+	});
+
+	pi.registerCommand("arcane-destroy", {
+		description: "Tear down a deployed Arcane project and its GitOps sync",
+		handler: async (args, ctx) => {
+			await runDestroy(args, ctx);
 		},
 	});
 
@@ -102,12 +113,17 @@ export default function arcaneExtension(pi: ExtensionAPI): void {
 			return box;
 		}
 
+		const envStatus = data.environmentStatus;
 		box.addChild(
 			new Text(
 				`${theme.bold("Arcane")} ${theme.fg("dim", data.host)} ${theme.fg(
 					"muted",
 					data.environmentName ?? data.environmentId,
-				)}`,
+				)}${
+					envStatus
+						? ` ${theme.fg(envStatus === "online" ? "success" : "warning", envStatus)}`
+						: ""
+				}`,
 			),
 		);
 

@@ -88,13 +88,15 @@ never written to disk by this extension, and redacted from all output.
 | `arcane_build` | Build an image on the Arcane host without deploying it. |
 | `arcane_logs` | Read container or project logs. |
 | `arcane_list` | List projects, syncs, containers, git repositories or environments. |
+| `arcane_destroy` | Tear down a project, its containers and its GitOps sync. Volumes kept unless asked. |
 
 ## Commands
 
 - `/arcane-setup` — wizard: host, API key, environment, write config. `/arcane-setup test` also runs
   a connection check.
-- `/arcane-status` — dashboard of projects, syncs and running containers, rendered into the
-  transcript.
+- `/arcane-status` — dashboard of environment status, projects, syncs and running containers,
+  rendered into the transcript.
+- `/arcane-destroy [project]` — pick a project and tear it down. Prompts before deleting volumes.
 
 ## How a deploy works
 
@@ -114,39 +116,44 @@ compose file that exists in the repo, so instead the image is built from the git
 (`POST /images/build` with a BuildKit git context) and run as a generated one-service compose
 project. **Your repository is never modified.**
 
-## Ports, container names and public URLs
+## Ports and public URLs
 
-The Docker host serves deployments through an existing nginx vhost:
+Deployments are reached at **`https://pi-<hostPort>.hajek.click`**, e.g. `https://pi-5553.hajek.click`.
 
-```nginx
-server_name ~^(?<t_name>t-[a-z0-9]+)\.hajek\.click$;
-set $target_upstream http://$t_name:5553;
-```
+This needs the vhost in [`nginx/pi-arcane.conf`](nginx/pi-arcane.conf) installed on the Docker host
+**once**; after that every future deployment works with no further nginx change.
 
-Two consequences drive the extension's behaviour, and they are easy to get wrong:
+### Why the hostname encodes a port
 
-- **The container must publish host port 5553**, because that is where nginx proxies.
-- **The container must be named exactly `t-<lowercase alphanumerics>`**, because nginx proxies to
-  that literal name. Compose's generated names (`compose-app-web-1`) do **not** match the pattern —
-  it allows no dashes after the prefix — and prepending `t-` to them yields a hostname Docker cannot
-  resolve. So a naive compose deployment runs fine but is unreachable.
+The obvious design — `pi-<appname>.hajek.click` proxying to a container by name — does not work on
+this host, and it fails in a way that looks like the app is broken:
 
-The extension therefore patches the compose document it hands to Arcane, filling in **only what is
-absent**:
+- Host nginx cannot resolve Docker container names. Each deployment lands on its own compose network
+  and Docker's embedded DNS is not reachable from the host, so `resolver 172.17.0.1` never answers.
+- The request then 502s after a ~30s DNS timeout — identical behaviour whether the container exists
+  or not, which makes it look like a deploy failure rather than a routing one.
 
-- adds `5553:80` if the primary service publishes nothing;
-- pins `container_name: t-<project>` if the service does not name itself.
+Encoding the published host port sidesteps DNS entirely and uses the same `127.0.0.1:<port>` upstream
+the host's other working vhosts already use.
 
-A compose file that sets its own ports or container name is left alone — that configuration is
-deliberate, and overriding it would break the deployment the repo asked for. In that case the
-extension reports what is actually published and, when the name cannot be routed, says so instead of
-printing a URL that would 502.
+### What the extension does
 
-The patch applies to Arcane's copy; **the file in git is untouched**. With `autoSync` off (the
-default) it is re-applied on every deploy. With `autoSync` on, Arcane's next poll overwrites it — the
-extension warns, and the fix is to commit the ports and `container_name` into the compose file.
+- Publishes each deployment on a **free host port**, starting at 5553 and scanning upward (5554,
+  5555, …) so a second app does not fail with *"port is already allocated"*. A project keeps its port
+  across redeploys.
+- Adds `<port>:80` to the compose file **only if the primary service publishes nothing**. A compose
+  file that publishes its own ports is being deliberate, and overriding it would break the
+  deployment the repo asked for — the extension reports what is actually published instead.
+- Reports a URL only for ports that are genuinely published; it never prints a plausible-looking URL
+  that would fail.
 
-Override the mapping per-deploy with `port_mapping`, or globally via `defaults.portMapping`.
+The patch applies to Arcane's copy — **the file in git is untouched**. With `autoSync` off (the
+default) it is re-applied on every deploy. With `autoSync` on, Arcane's next poll overwrites it; the
+extension warns, and the fix is to commit the ports into the compose file.
+
+Override with the `port_mapping` tool argument or `defaults.portMapping`. Ports outside 5550–5599 are
+rejected by the vhost's guard (which stops a crafted hostname reaching, say, Arcane's own port) —
+widen the range in the config if you need one.
 
 ## Container logs
 
@@ -176,10 +183,12 @@ verifies over HTTP that the deployed page serves what is in git.
 
 Prerequisites:
 
-- `ARCANE_API_KEY` exported.
+- `ARCANE_API_KEY` exported (or an `arcane.json` in one of the config locations).
 - The branch under test pushed to `origin` (Arcane clones from the remote, not your working tree).
 - `GITHUB_TOKEN` exported if this repository is private.
-- Wildcard DNS `*.hajek.click` pointing at the nginx host, and the existing `t-*` vhost in place.
+- [`nginx/pi-arcane.conf`](nginx/pi-arcane.conf) installed on the Docker host, for the URL check.
+- The API key needs `git-repositories:create` and `:update` on top of the usual project, gitops,
+  images and container scopes.
 
 ```bash
 export ARCANE_API_KEY=...
@@ -188,8 +197,8 @@ npm run e2e              # both fixtures
 npm run e2e -- compose   # just one
 ```
 
-The harness deploys each fixture, polls `https://t-composeapp.hajek.click` /
-`https://t-dockerfileapp.hajek.click` until the page contains the `<h1>` text from the committed
+The harness deploys each fixture, reads back the host port each one actually got, polls
+`https://pi-<port>.hajek.click` until the page contains the `<h1>` text from the committed
 `index.html`, then exercises `arcane_status` and `arcane_logs`. It exits non-zero if any check fails.
 
 To test the full develop → deploy loop by hand:

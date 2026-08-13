@@ -5,7 +5,7 @@
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { publicUrlForContainer, requireRuntime, unroutableReason } from "../runtime.ts";
+import { publicUrlsForContainer, requireRuntime } from "../runtime.ts";
 import type { ContainerSummary, GitOpsSync, ProjectDetails } from "../types.ts";
 import { fields, toolError } from "./shared.ts";
 
@@ -133,8 +133,9 @@ function renderProjects(projects: ProjectDetails[], containers: ContainerSummary
 				])}`,
 			);
 			if (container.state === "running") {
-				const url = publicUrlForContainer(name);
-				lines.push(url ? `      url: ${url}` : `      url: none (${unroutableReason(name)})`);
+				const urls = publicUrlsForContainer(container.ports);
+				if (urls.length > 0) lines.push(`      url: ${urls.join("  ")}`);
+				else lines.push("      url: none (publishes no host port)");
 			}
 		}
 		if (projectContainers.length === 0) lines.push("    - (no containers)");

@@ -23,17 +23,12 @@ import {
 	generateCompose,
 	prepareCompose,
 	readComposeFile,
+	readComposeInfo,
 	type PublishedPort,
 } from "../compose.ts";
-import { branchExistsOnRemote, isBranchPushed, readGitContext, sanitizeName } from "../git.ts";
+import { checkRemoteBranch, readGitContext, sanitizeName } from "../git.ts";
 import { buildKitContext, registerRepository, resolveRepo } from "../repo.ts";
-import {
-	projectUiUrl,
-	publicUrlForContainer,
-	requireRuntime,
-	routableContainerName,
-	unroutableReason,
-} from "../runtime.ts";
+import { projectUiUrl, publicUrlsForContainer, requireRuntime } from "../runtime.ts";
 import {
 	DEPLOYMENT_ENTRY_TYPE,
 	type ContainerSummary,
@@ -175,14 +170,22 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 						"The working tree has uncommitted changes; Arcane deploys the pushed commit, not your local edits.",
 					);
 				}
-				if (!(await branchExistsOnRemote(git.repoRoot, branch, "origin", signal))) {
+				const remoteBranch = await checkRemoteBranch(git.repoRoot, branch, "origin", signal);
+				if (remoteBranch.state === "absent") {
 					throw new Error(
 						`Branch "${branch}" does not exist on origin. Push it first — Arcane clones the branch from the remote.`,
 					);
 				}
-				if (!(await isBranchPushed(git.repoRoot, branch, "origin", signal))) {
+				if (remoteBranch.state === "unknown") {
+					// Could not reach the remote (no SSH agent, no token, offline).
+					// Deploying anyway is right: Arcane clones with its own
+					// credentials, which are unrelated to this machine's.
 					warnings.push(
-						`Local "${branch}" is ahead of origin/${branch}; Arcane will deploy the commit currently on the remote.`,
+						`Could not verify origin/${branch} from here (${remoteBranch.error?.split("\n")[0] ?? "unknown error"}). Proceeding — Arcane clones with its own credentials. If the branch is unpushed, Arcane will deploy an older commit.`,
+					);
+				} else if (remoteBranch.upToDate === false) {
+					warnings.push(
+						`Local "${branch}" (${remoteBranch.localCommit?.slice(0, 8)}) differs from origin/${branch} (${remoteBranch.remoteCommit?.slice(0, 8)}); Arcane deploys the commit on the remote.`,
 					);
 				}
 
@@ -255,7 +258,6 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 				let project: ProjectDetails | undefined;
 				let portNote: string | undefined;
 				let expectedPort: PublishedPort | undefined;
-				let expectedContainer: string | undefined;
 
 				if (targetType === "compose") {
 					const result = await deployViaGitOps({
@@ -278,7 +280,6 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 					project = result.project;
 					portNote = result.portNote;
 					expectedPort = result.expectedPort;
-					expectedContainer = result.expectedContainer;
 					record.syncId = result.sync.id;
 					record.syncName = result.sync.name;
 					warnings.push(...result.warnings);
@@ -300,7 +301,6 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 					});
 					project = result.project;
 					expectedPort = result.expectedPort;
-					expectedContainer = result.expectedContainer;
 				}
 
 				record.projectId = project?.id;
@@ -312,12 +312,15 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 				const endpoints = projectContainers.map((container) => {
 					const name = (container.names ?? [])[0]?.replace(/^\//, "") ?? container.id.slice(0, 12);
 					const published = (container.ports ?? []).filter((p) => p.publicPort);
+					const urls =
+						container.state === "running" ? publicUrlsForContainer(container.ports) : [];
 					return {
 						name,
 						state: container.state,
 						status: container.status,
 						ports: published.map((p) => `${p.publicPort}->${p.privatePort}/${p.type}`),
-						url: container.state === "running" ? publicUrlForContainer(name) : undefined,
+						urls,
+						url: urls[0],
 					};
 				});
 
@@ -355,13 +358,16 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 							["ports", endpoint.ports.join(",")],
 						])}`,
 					);
-					if (endpoint.url) lines.push(`    ${endpoint.url}`);
-					else if (endpoint.state === "running")
-						lines.push(`    (${unroutableReason(endpoint.name)})`);
+					for (const url of endpoint.urls) lines.push(`    ${url}`);
+					if (endpoint.state === "running" && endpoint.urls.length === 0) {
+						lines.push(
+							"    (publishes no host port, so it has no public URL — routing is by published port)",
+						);
+					}
 				}
 
 				// Say plainly when the deployment is up but unreachable, rather than
-				// leaving the user to discover it by clicking a URL that 502s.
+				// leaving the user to discover it by clicking a URL that fails.
 				const publishedExpectedPort =
 					expectedPort !== undefined &&
 					endpoints.some((e) => e.ports.some((p) => p.startsWith(`${expectedPort!.host}->`)));
@@ -369,13 +375,7 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 				if (expectedPort && endpoints.length > 0 && !publishedExpectedPort) {
 					lines.push("");
 					lines.push(
-						`Note: nothing is published on host port ${expectedPort.host}. The t-*.${"hajek.click"} vhost proxies to that port, so the public URL will not work.`,
-					);
-				}
-				if (expectedContainer && !endpoints.some((e) => e.name === expectedContainer)) {
-					lines.push("");
-					lines.push(
-						`Note: expected a container named "${expectedContainer}" but none appeared; the public URL is derived from that name.`,
+						`Note: expected host port ${expectedPort.host} to be published, but it is not. Public URLs are derived from the published host port.`,
 					);
 				}
 
@@ -431,7 +431,6 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 	project?: ProjectDetails;
 	portNote?: string;
 	expectedPort?: PublishedPort;
-	expectedContainer?: string;
 	warnings: string[];
 }> {
 	const {
@@ -459,15 +458,32 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 	let expectedPort: PublishedPort | undefined;
 	let portNote: string | undefined;
 	let patchedCompose: string | undefined;
-	let expectedContainer: string | undefined;
+	// A compose file with a `build:` directive needs its build context — the
+	// Dockerfile and everything it COPYs. Syncing the compose file alone leaves
+	// Arcane with nothing to build from.
+	let needsBuildContext = false;
 
 	if (localCompose) {
+		needsBuildContext = readComposeInfo(localCompose).services.some((s) => s.hasBuild);
+
+		// Only relevant when the compose file publishes nothing and we supply the
+		// mapping; an explicit port in git is the repo's decision to keep.
+		const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
+		const allocated = await allocateHostPort(
+			client,
+			environmentId,
+			projectName,
+			wanted.host,
+			signal,
+		);
+		if (allocated.moved) {
+			step(`Host port ${wanted.host} is taken; using ${allocated.port} instead.`);
+		}
+
 		const patch = prepareCompose(localCompose, {
-			portMapping,
-			routableName: routableContainerName(projectName),
+			portMapping: `${allocated.port}:${wanted.container}`,
 		});
 		expectedPort = patch.effectivePort;
-		expectedContainer = patch.containerName;
 		portNote = patch.notes.join("; ");
 		if (patch.changed) {
 			patchedCompose = patch.content;
@@ -508,6 +524,7 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 				targetType: "compose",
 				autoSync,
 				syncInterval: syncInterval ?? existing.syncInterval,
+				syncDirectory: needsBuildContext || existing.syncDirectory,
 			},
 			signal,
 		);
@@ -524,10 +541,13 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 				targetType: "compose",
 				autoSync,
 				syncInterval: syncInterval ?? 60,
+				syncDirectory: needsBuildContext,
 			},
 			signal,
 		);
-		step(`GitOps sync created: ${sync.name} (${sync.id})`);
+		step(
+			`GitOps sync created: ${sync.name} (${sync.id})${needsBuildContext ? " — syncing the whole directory for the build context" : ""}`,
+		);
 	}
 
 	// --- 6. Trigger the sync -------------------------------------------------
@@ -563,7 +583,6 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 			step(`Patched Arcane's compose copy: ${portNote}`);
 		} catch (error) {
 			warnings.push(`Could not patch the compose file in Arcane: ${(error as Error).message}`);
-			expectedContainer = undefined;
 		}
 	}
 
@@ -579,7 +598,7 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 
 	project = await waitForProjectSettled(client, environmentId, project.id, signal, step);
 
-	return { sync, project, portNote, expectedPort, expectedContainer, warnings };
+	return { sync, project, portNote, expectedPort, warnings };
 }
 
 // ---------------------------------------------------------------------------
@@ -605,7 +624,6 @@ interface ImageBuildArgs {
 async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 	project?: ProjectDetails;
 	expectedPort?: PublishedPort;
-	expectedContainer?: string;
 }> {
 	const {
 		client,
@@ -647,17 +665,26 @@ async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 	step(`Built ${tag}.`);
 
 	// The generated compose runs the freshly built image; the repo is untouched.
-	const containerName = routableContainerName(projectName);
+	const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
+	const allocated = await allocateHostPort(
+		client,
+		environmentId,
+		projectName,
+		wanted.host,
+		signal,
+	);
+	if (allocated.moved) {
+		step(`Host port ${wanted.host} is taken; using ${allocated.port} instead.`);
+	}
+	const host = allocated.port;
+	const container = wanted.container;
+
 	const composeContent = generateCompose({
 		serviceName: "web",
 		image: tag,
-		portMapping,
+		portMapping: `${host}:${container}`,
 		env: envVars,
-		containerName,
 	});
-	const { host, container } = parsePortMapping(
-		portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`,
-	);
 
 	const projects = await client.listProjects(environmentId, signal);
 	const existing = projects.find((p) => p.name === projectName);
@@ -689,7 +716,7 @@ async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 
 	project = await waitForProjectSettled(client, environmentId, project.id, signal, step);
 
-	return { project, expectedPort: { host, container }, expectedContainer: containerName };
+	return { project, expectedPort: { host, container } };
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +774,53 @@ async function waitForProjectSettled(
 	}
 
 	return project;
+}
+
+/**
+ * Pick a free host port for this project, starting at `preferred`.
+ *
+ * Two projects cannot bind the same host port, so a second deployment with the
+ * default 5553 fails with "port is already allocated". Ports already held by
+ * *this* project are not treated as taken, so redeploys keep a stable port
+ * instead of drifting upward on every run.
+ */
+async function allocateHostPort(
+	client: ImageBuildArgs["client"],
+	environmentId: string,
+	projectName: string,
+	preferred: string,
+	signal: AbortSignal | undefined,
+): Promise<{ port: string; moved: boolean }> {
+	const start = Number.parseInt(preferred, 10);
+	if (!Number.isFinite(start)) return { port: preferred, moved: false };
+
+	let containers: ContainerSummary[];
+	try {
+		containers = await client.listContainers(environmentId, signal);
+	} catch {
+		// If the list is unavailable, use the preferred port and let Docker be
+		// the authority on whether it is free.
+		return { port: preferred, moved: false };
+	}
+
+	const ours = new Set(containersForProject(containers, projectName).map((c) => c.id));
+	const taken = new Set<number>();
+	for (const container of containers) {
+		if (ours.has(container.id)) continue;
+		for (const port of container.ports ?? []) {
+			if (port.publicPort) taken.add(port.publicPort);
+		}
+	}
+
+	// Stay inside the range the routing vhost accepts (see nginx/pi-arcane.conf);
+	// a port outside it would deploy fine but have no working URL.
+	const limit = start === Number.parseInt(DEFAULT_HOST_PORT, 10) ? 5599 : start + 20;
+	for (let candidate = start; candidate <= limit; candidate += 1) {
+		if (!taken.has(candidate)) {
+			return { port: String(candidate), moved: candidate !== start };
+		}
+	}
+	return { port: preferred, moved: false };
 }
 
 /** Match by the compose project label Docker sets, falling back to name prefix. */

@@ -18,9 +18,20 @@ export function toolError(error: unknown): Error {
 	if (error instanceof ArcaneSetupError) return error;
 
 	if (error instanceof ArcaneApiError) {
-		if (error.isAuthError) {
+		// 401 and 403 mean different things and have different fixes: a bad key
+		// versus a valid key that was not granted a scope. Conflating them sends
+		// people to re-check credentials that are perfectly fine.
+		if (error.status === 401) {
 			return new Error(
 				`${error.message}\nThe Arcane API key was rejected. Verify apiKey in arcane.json / ARCANE_API_KEY, or run /arcane-setup.`,
+			);
+		}
+		if (error.status === 403) {
+			const scope = /permission denied:\s*([\w.:-]+)/i.exec(error.detail ?? "")?.[1];
+			return new Error(
+				`${error.message}\nThe API key authenticated but lacks ${
+					scope ? `the "${scope}" permission` : "permission for this operation"
+				}. Grant it to the key in Arcane (Settings → API Keys), or use a key with broader scope.`,
 			);
 		}
 		if (error.isNotFound) {

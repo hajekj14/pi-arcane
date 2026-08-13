@@ -6,7 +6,7 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { publicUrlForContainer, requireRuntime } from "../runtime.ts";
+import { publicUrlsForContainer, requireRuntime } from "../runtime.ts";
 import { toolError } from "./shared.ts";
 
 const parameters = Type.Object({
@@ -124,7 +124,7 @@ export function createListTool(): ToolDefinition<typeof parameters> {
 								`state=${container.state}`,
 								`image=${container.image}`,
 								ports ? `ports=${ports}` : "",
-								container.state === "running" ? publicUrlForContainer(name) : "",
+								container.state === "running" ? publicUrlsForContainer(container.ports).join(" ") : "",
 							]
 								.filter(Boolean)
 								.join("  ");

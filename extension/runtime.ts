@@ -174,37 +174,30 @@ export function primeRuntime(config: ArcaneConfig): void {
 // ---------------------------------------------------------------------------
 
 /**
- * Names the host's nginx vhost can route to.
+ * Public URLs are port-encoded: `pi-<hostPort>.hajek.click`.
  *
- * The existing `dynamic-tests` vhost matches `~^(?<t_name>t-[a-z0-9]+)\.hajek\.click$`
- * and proxies to `http://$t_name:5553` — so the Docker container must be named
- * exactly `t-<lowercase alphanumerics>`. Dashes and underscores after the
- * prefix do not match, which is why Compose's generated names
- * (`myapp-web-1`) are not reachable and a `container_name` has to be pinned.
+ * The routing vhost (see `nginx/pi-arcane.conf`) matches
+ * `~^pi-(?<pi_port>\d+)\.hajek\.click$` and proxies to `127.0.0.1:$pi_port`,
+ * the same pattern the host's other working vhosts use.
+ *
+ * Name-based routing was tried first and cannot work here: host nginx has no
+ * way to resolve Docker container names — every deployment lands on its own
+ * compose network, and the embedded DNS is not reachable from the host — so
+ * `proxy_pass http://<container>:port` fails resolution and 502s. Encoding the
+ * published host port in the hostname needs no Docker DNS at all, and means the
+ * vhost is written once and never touched again.
  */
-const ROUTABLE_NAME = /^t-[a-z0-9]+$/;
-
-/** Container name for `projectName` that the `t-*` vhost will actually match. */
-export function routableContainerName(projectName: string): string {
-	const alnum = projectName.toLowerCase().replace(/[^a-z0-9]/g, "");
-	return `${PUBLIC_HOST_PREFIX}${alnum || "app"}`;
+export function publicUrlForPort(hostPort: string | number): string {
+	return `https://${PUBLIC_HOST_PREFIX}${hostPort}.${PUBLIC_DOMAIN}`;
 }
 
-/**
- * Public URL for a container, or `undefined` when its name cannot be routed by
- * the host's vhost. Returning `undefined` rather than a plausible-looking URL
- * keeps the deploy report honest — a guessed URL that 502s is worse than none.
- */
-export function publicUrlForContainer(containerName: string): string | undefined {
-	const name = containerName.replace(/^\//, "");
-	if (!ROUTABLE_NAME.test(name)) return undefined;
-	return `https://${name}.${PUBLIC_DOMAIN}`;
-}
-
-/** Explain why a container name has no public URL. */
-export function unroutableReason(containerName: string): string {
-	const name = containerName.replace(/^\//, "");
-	return `container "${name}" does not match the host's t-[a-z0-9]+ vhost pattern, so it has no ${PUBLIC_DOMAIN} URL`;
+/** Public URLs for every host port a container publishes. */
+export function publicUrlsForContainer(ports: Array<{ publicPort?: number }> | null | undefined): string[] {
+	const seen = new Set<number>();
+	for (const port of ports ?? []) {
+		if (port.publicPort) seen.add(port.publicPort);
+	}
+	return [...seen].sort((a, b) => a - b).map(publicUrlForPort);
 }
 
 /** Link to a project in the Arcane web UI. */

@@ -5,9 +5,9 @@
  * against both fixtures, then verifies over HTTP that the deployed page really
  * serves the content that is in git.
  *
- * Requires:
- *   ARCANE_API_KEY   an Arcane API key
- *   GITHUB_TOKEN     (only if this repo is private, so Arcane can clone it)
+ * Credentials come from the same place the extension reads them: ARCANE_API_KEY,
+ * or an `arcane.json` found by the normal resolution order. Set `GITHUB_TOKEN`
+ * as well if this repository is private, so Arcane can clone it.
  *
  * Run with:
  *   node --experimental-strip-types scripts/e2e.ts [compose|dockerfile]
@@ -22,15 +22,33 @@ import { createDeployTool } from "../extension/tools/deploy.ts";
 import { createLogsTool } from "../extension/tools/logs.ts";
 import { createStatusTool } from "../extension/tools/status.ts";
 import { createListTool } from "../extension/tools/list.ts";
-import { resetRuntime, routableContainerName } from "../extension/runtime.ts";
+import { resetRuntime } from "../extension/runtime.ts";
+import { configSearchPaths, loadConfig } from "../extension/config.ts";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-if (!process.env.ARCANE_API_KEY) {
-	console.error("ARCANE_API_KEY is not set. Export it and re-run.");
+// Resolve credentials exactly the way the extension does, so a config file
+// works as well as the environment variable.
+const preflight = await loadConfig(repoRoot).catch((error: Error) => {
+	console.error(`Arcane config is present but unusable: ${error.message}`);
+	process.exit(2);
+});
+
+if (!preflight) {
+	console.error(
+		[
+			"No Arcane credentials found. Either export ARCANE_API_KEY, or create one of:",
+			...configSearchPaths(repoRoot).map((p) => `  ${p}`),
+			'containing: { "apiKey": "your-key" }',
+		].join("\n"),
+	);
 	process.exit(2);
 }
+
+console.log(
+	`Auth:   ${preflight.sourcePath ? `arcane.json (${preflight.sourcePath})` : "ARCANE_API_KEY"}`,
+);
 
 // --- stub extension host ----------------------------------------------------
 
@@ -63,7 +81,11 @@ function makeCtx(cwd: string): any {
 	};
 }
 
-async function runTool(tool: any, params: unknown, cwd: string): Promise<string> {
+async function runTool(
+	tool: any,
+	params: unknown,
+	cwd: string,
+): Promise<{ text: string; details: any }> {
 	const result = await tool.execute(
 		"e2e",
 		params,
@@ -77,7 +99,10 @@ async function runTool(tool: any, params: unknown, cwd: string): Promise<string>
 		},
 		makeCtx(cwd),
 	);
-	return result.content.map((c: any) => c.text ?? "").join("\n");
+	return {
+		text: result.content.map((c: any) => c.text ?? "").join("\n"),
+		details: result.details,
+	};
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -171,7 +196,7 @@ console.log(`Arcane: ${process.env.ARCANE_HOST ?? "https://arcane.hajek.click"}\
 
 // Sanity: the environment must be reachable before anything else is meaningful.
 try {
-	const listed = await runTool(listTool, { resource: "environments" }, repoRoot);
+	const listed = (await runTool(listTool, { resource: "environments" }, repoRoot)).text;
 	console.log(listed.split("\n").slice(0, 4).join("\n"));
 	console.log();
 } catch (error) {
@@ -185,12 +210,15 @@ for (const fixture of selected) {
 
 	// 1. Deploy ---------------------------------------------------------------
 	let deployOutput = "";
+	let deployDetails: any;
 	try {
-		deployOutput = await runTool(
+		const deployed = await runTool(
 			deployTool,
 			{ project_name: fixture.projectName, branch },
 			fixture.dir,
 		);
+		deployOutput = deployed.text;
+		deployDetails = deployed.details;
 		record(fixture.key, "arcane_deploy", true);
 	} catch (error) {
 		record(fixture.key, "arcane_deploy", false, (error as Error).message);
@@ -200,8 +228,12 @@ for (const fixture of selected) {
 	console.log(indent(deployOutput));
 
 	// 2. Verify over HTTP -----------------------------------------------------
-	const containerName = routableContainerName(fixture.projectName);
-	const url = `https://${containerName}.hajek.click`;
+	const endpoints: any[] = deployDetails?.endpoints ?? [];
+	const url: string | undefined = endpoints.flatMap((e: any) => e.urls ?? [])[0];
+	if (!url) {
+		record(fixture.key, "deploy reported a public URL", false, "no container published a host port");
+		continue;
+	}
 	const expected = await readFile(fixture.htmlPath, "utf8");
 	const marker = extractMarker(expected) ?? fixture.marker;
 
@@ -217,7 +249,8 @@ for (const fixture of selected) {
 
 	// 3. Status ---------------------------------------------------------------
 	try {
-		const status = await runTool(statusTool, { project_name: fixture.projectName }, fixture.dir);
+		const status = (await runTool(statusTool, { project_name: fixture.projectName }, fixture.dir))
+			.text;
 		const running = /status=running/i.test(status) || /● /.test(status);
 		record(fixture.key, "arcane_status reports the project", running, status.slice(0, 300));
 		console.log(indent(status));
@@ -227,11 +260,9 @@ for (const fixture of selected) {
 
 	// 4. Logs -----------------------------------------------------------------
 	try {
-		const logs = await runTool(
-			logsTool,
-			{ container_id: containerName, tail: 50 },
-			fixture.dir,
-		);
+		const logs = (
+			await runTool(logsTool, { project_name: fixture.projectName, tail: 50 }, fixture.dir)
+		).text;
 		record(fixture.key, "arcane_logs returns output", logs.length > 0, logs.slice(0, 200));
 		console.log(indent(logs.split("\n").slice(0, 12).join("\n")));
 	} catch (error) {

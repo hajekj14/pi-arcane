@@ -16,11 +16,13 @@ import {
 	type BasePaginated,
 	type BranchesResponse,
 	type BranchInfo,
+	type BrowseResponse,
 	type BuildProjectRequest,
 	type BuildRequest,
 	type ContainerDetails,
 	type ContainerListResponse,
 	type ContainerSummary,
+	type DashboardSnapshot,
 	type CreateGitRepositoryRequest,
 	type CreateProjectRequest,
 	type CreateProjectResponse,
@@ -29,11 +31,13 @@ import {
 	type DestroyOptions,
 	type Environment,
 	type ErrorModel,
+	type FileTreeNode,
 	type GitOpsSync,
 	type GitRepository,
 	type ImageBuildRecord,
 	type MessageResponse,
 	type ProjectDetails,
+	type RepositorySync,
 	type SyncResult,
 	type SyncStatus,
 	type UpdateGitRepositoryRequest,
@@ -376,6 +380,38 @@ export class ArcaneClient {
 		});
 	}
 
+	/**
+	 * Browse a repository's tree without cloning it, so a deploy can confirm the
+	 * compose path exists on the branch Arcane will actually read.
+	 */
+	async browseFiles(
+		id: string,
+		path?: string,
+		branch?: string,
+		signal?: AbortSignal,
+	): Promise<FileTreeNode[]> {
+		const res = await this.request<BrowseResponse>(
+			"GET",
+			`/customize/git-repositories/${enc(id)}/files`,
+			{ query: { path, branch }, signal, timeoutMs: 90_000 },
+		);
+		return res.entries ?? res.files ?? [];
+	}
+
+	/**
+	 * Push a set of repository definitions into Arcane.
+	 *
+	 * The endpoint takes whole repository objects, not IDs — pass records from
+	 * `listRepositories()` (optionally with `token`/`sshKey` filled in).
+	 */
+	syncRepositories(repositories: RepositorySync[], signal?: AbortSignal): Promise<MessageResponse> {
+		return this.request<MessageResponse>("POST", "/git-repositories/sync", {
+			body: { repositories },
+			signal,
+			timeoutMs: 5 * 60_000,
+		});
+	}
+
 	async listBranches(id: string, signal?: AbortSignal): Promise<BranchInfo[]> {
 		const res = await this.request<BranchesResponse>(
 			"GET",
@@ -395,6 +431,11 @@ export class ArcaneClient {
 
 	getEnvironment(id: string, signal?: AbortSignal): Promise<Environment> {
 		return this.request<Environment>("GET", `/environments/${enc(id)}`, { signal });
+	}
+
+	/** Aggregate counts and action items for the environment. */
+	getDashboard(id: string, signal?: AbortSignal): Promise<DashboardSnapshot> {
+		return this.request<DashboardSnapshot>("GET", `/environments/${enc(id)}/dashboard`, { signal });
 	}
 
 	// -----------------------------------------------------------------------
@@ -590,9 +631,19 @@ export class ArcaneClient {
 		});
 	}
 
+	/**
+	 * Pull `image` onto the environment's host. The API takes name and tag
+	 * separately, so a `name:tag` reference is split here — taking care not to
+	 * mistake a registry port (`host:5000/img`) for a tag.
+	 */
 	pullImage(envId: string, image: string, signal?: AbortSignal): Promise<string> {
+		const lastColon = image.lastIndexOf(":");
+		const hasTag = lastColon > image.lastIndexOf("/");
+		const imageName = hasTag ? image.slice(0, lastColon) : image;
+		const tag = hasTag ? image.slice(lastColon + 1) : undefined;
+
 		return this.request<string>("POST", `/environments/${enc(envId)}/images/pull`, {
-			body: { imageName: image },
+			body: { imageName, ...(tag ? { tag } : {}) },
 			signal,
 			raw: true,
 			timeoutMs: 15 * 60_000,

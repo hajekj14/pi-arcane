@@ -94,6 +94,15 @@ export interface CreateGitRepositoryRequest {
 
 export type UpdateGitRepositoryRequest = Partial<CreateGitRepositoryRequest>;
 
+/**
+ * A whole repository record as `POST /git-repositories/sync` expects them —
+ * the endpoint takes objects, not IDs. Credentials are optional.
+ */
+export interface RepositorySync extends GitRepository {
+	token?: string;
+	sshKey?: string;
+}
+
 export interface BranchInfo {
 	name: string;
 	isDefault: boolean;
@@ -101,6 +110,22 @@ export interface BranchInfo {
 
 export interface BranchesResponse {
 	branches: BranchInfo[] | null;
+}
+
+/** One entry when browsing a repository's tree. */
+export interface FileTreeNode {
+	name?: string;
+	path?: string;
+	type?: string;
+	isDirectory?: boolean;
+	size?: number;
+}
+
+/** Arcane has used both key names for the listing, so accept either. */
+export interface BrowseResponse {
+	entries?: FileTreeNode[] | null;
+	files?: FileTreeNode[] | null;
+	path?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +380,25 @@ export interface ActivityMessage {
 export interface ActivityDetail {
 	activity: Activity;
 	messages: ActivityMessage[] | null;
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+/**
+ * `containers` and `images` are full paginated collections, each carrying its
+ * own counts — not plain totals.
+ */
+export interface DashboardSnapshot {
+	containers: {
+		counts: ContainerStatusCounts;
+		data: ContainerSummary[] | null;
+		pagination: PaginationResponse;
+	};
+	images: { data: unknown[] | null; pagination: PaginationResponse };
+	actionItems?: { items?: Array<{ kind: string; count: number; severity: string }> | null };
+	versionInfo?: { version?: string };
 }
 
 // ---------------------------------------------------------------------------

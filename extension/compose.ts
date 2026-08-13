@@ -219,25 +219,18 @@ export interface ComposePatchResult {
 export interface PreparePatchOptions {
 	/** `"HOST:CONTAINER"`. Defaults to `5553:80`. */
 	portMapping?: string;
-	/**
-	 * Container name to pin on the primary service so the host's nginx vhost
-	 * can route to it. Skipped when the service already names itself.
-	 */
-	routableName?: string;
 }
 
 /**
  * Prepare a compose document for deployment (plan 9.5).
  *
- * Two things are filled in, and only when they are absent — a repo that
- * configures its own ports or container names is deliberate, and overriding it
- * would break the deployment it asked for:
+ * Only one thing is filled in, and only when it is absent: a published host
+ * port, so the service is reachable. Routing is by published port
+ * (`pi-<port>.hajek.click`), so nothing about the container's name matters and
+ * the compose file is left otherwise untouched.
  *
- * - a published host port, so the service is reachable at all;
- * - a fixed `container_name`, so the host's `t-*.hajek.click` vhost can find
- *   it. Compose's generated names (`myapp-web-1`) do not match that vhost's
- *   `t-[a-z0-9]+` pattern, so without this the deployment runs but no URL
- *   resolves.
+ * A repo that publishes its own ports is being deliberate, and overriding that
+ * would break the deployment it asked for.
  *
  * The file in git is never touched; this patches the copy Arcane holds.
  */
@@ -282,18 +275,11 @@ export function prepareCompose(
 		notes.push(`added ${host}:${container} to service "${primary.name}" (it published nothing)`);
 	}
 
-	// --- container name ------------------------------------------------------
-	let containerName = primary.containerName;
-	if (containerName) {
-		notes.push(`service "${primary.name}" sets container_name "${containerName}" — left as-is`);
-	} else if (options.routableName) {
-		target.container_name = options.routableName;
-		containerName = options.routableName;
-		changed = true;
-		notes.push(`pinned container_name "${options.routableName}" so the public URL resolves`);
-	}
+	const containerName = primary.containerName;
 
-	if (!changed) return { content, changed, effectivePort, serviceName: primary.name, containerName, notes };
+	if (!changed) {
+		return { content, changed, effectivePort, serviceName: primary.name, containerName, notes };
+	}
 
 	services[primary.name] = target;
 	doc.services = services;

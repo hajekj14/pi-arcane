@@ -7,11 +7,19 @@
  */
 
 import assert from "node:assert/strict";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import arcaneExtension from "../extension/index.ts";
 import { generateCompose, prepareCompose, readComposeInfo } from "../extension/compose.ts";
-import { embedToken, parseGitUrl, redactUrl, sanitizeName } from "../extension/git.ts";
+import {
+	checkRemoteBranch,
+	embedToken,
+	parseGitUrl,
+	redactUrl,
+	sanitizeName,
+} from "../extension/git.ts";
 import { parsePortMapping, resolveSecret, normalizeHost } from "../extension/config.ts";
-import { publicUrlForContainer, routableContainerName } from "../extension/runtime.ts";
+import { publicUrlForPort, publicUrlsForContainer } from "../extension/runtime.ts";
 import { sameRepo, buildKitContext } from "../extension/repo.ts";
 
 const tools: any[] = [];
@@ -34,6 +42,7 @@ const toolNames = tools.map((t) => t.name).sort();
 assert.deepEqual(toolNames, [
 	"arcane_build",
 	"arcane_deploy",
+	"arcane_destroy",
 	"arcane_list",
 	"arcane_logs",
 	"arcane_status",
@@ -44,7 +53,11 @@ for (const tool of tools) {
 	assert.ok(tool.parameters, `${tool.name} has parameters`);
 	assert.equal(typeof tool.execute, "function", `${tool.name} is executable`);
 }
-assert.deepEqual(commands.map((c) => c.name).sort(), ["arcane-setup", "arcane-status"]);
+assert.deepEqual(commands.map((c) => c.name).sort(), [
+	"arcane-destroy",
+	"arcane-setup",
+	"arcane-status",
+]);
 assert.deepEqual(events.sort(), ["session_shutdown", "session_start"]);
 assert.deepEqual(renderers.sort(), ["arcane-deployment", "arcane-status"]);
 
@@ -83,6 +96,26 @@ assert.equal(
 	"https://github.com/a/b.git#main",
 );
 
+// --- remote branch state ---------------------------------------------------
+// A remote that cannot be reached must report "unknown", never "absent" —
+// otherwise an auth or network failure tells the user to push work that is
+// already pushed. Using this repo as its own remote keeps the test offline.
+{
+	const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+	const present = await checkRemoteBranch(repoRoot, "main", repoRoot);
+	assert.equal(present.state, "present");
+	assert.equal(present.upToDate, true, "local main matches itself");
+	assert.ok(present.remoteCommit);
+
+	const absent = await checkRemoteBranch(repoRoot, "no-such-branch-xyz", repoRoot);
+	assert.equal(absent.state, "absent", "a reachable remote without the branch is absent");
+
+	const unreachable = await checkRemoteBranch(repoRoot, "main", "not-a-real-remote-xyz");
+	assert.equal(unreachable.state, "unknown", "an unreachable remote is unknown, not absent");
+	assert.ok(unreachable.error, "the failure reason is reported");
+}
+
 // --- config ----------------------------------------------------------------
 assert.equal(normalizeHost("https://arcane.hajek.click/api/"), "https://arcane.hajek.click");
 assert.deepEqual(parsePortMapping("8080:80"), { host: "8080", container: "80" });
@@ -99,16 +132,9 @@ const info = readComposeInfo(fixture);
 assert.equal(info.primaryService?.name, "web");
 assert.deepEqual(info.primaryService?.publishedPorts, [{ host: "5553", container: "80" }]);
 
-// The port is already right, but the container name still has to be pinned or
-// Compose would generate "compose-app-web-1", which the vhost cannot route.
-const alreadyMapped = prepareCompose(fixture, { routableName: "t-composeapp" });
+const alreadyMapped = prepareCompose(fixture);
 assert.deepEqual(alreadyMapped.effectivePort, { host: "5553", container: "80" });
-assert.equal(alreadyMapped.changed, true, "container_name is pinned even when ports are fine");
-assert.equal(alreadyMapped.containerName, "t-composeapp");
-assert.equal(
-	readComposeInfo(alreadyMapped.content).primaryService?.containerName,
-	"t-composeapp",
-);
+assert.equal(alreadyMapped.changed, false, "an existing mapping is left untouched");
 assert.deepEqual(
 	readComposeInfo(alreadyMapped.content).primaryService?.publishedPorts,
 	[{ host: "5553", container: "80" }],
@@ -136,41 +162,31 @@ assert.deepEqual(
 	"no second mapping is added alongside the user's",
 );
 
-const ownName = prepareCompose(
-	'services:\n  web:\n    image: nginx\n    container_name: my-own\n    ports:\n      - "5553:80"\n',
-	{ routableName: "t-something" },
-);
-assert.equal(ownName.changed, false, "a compose file that names its own container is untouched");
-assert.equal(ownName.containerName, "my-own");
+
 
 const longSyntax = readComposeInfo(
 	"services:\n  web:\n    image: nginx\n    ports:\n      - target: 80\n        published: '5553'\n",
 );
 assert.deepEqual(longSyntax.primaryService?.publishedPorts, [{ host: "5553", container: "80" }]);
 
-const generated = generateCompose({
-	serviceName: "web",
-	image: "app:main",
-	containerName: "t-app",
-});
+const generated = generateCompose({ serviceName: "web", image: "app:main" });
 const generatedInfo = readComposeInfo(generated);
 assert.equal(generatedInfo.primaryService?.image, "app:main");
-assert.equal(generatedInfo.primaryService?.containerName, "t-app");
 assert.deepEqual(generatedInfo.primaryService?.publishedPorts, [{ host: "5553", container: "80" }]);
 
 // --- public URLs -----------------------------------------------------------
-// The host vhost matches `t-[a-z0-9]+` and proxies to that exact container
-// name, so anything with a dash after the prefix is genuinely unreachable and
-// must report no URL rather than a plausible-looking one.
-assert.equal(publicUrlForContainer("/t-myapp"), "https://t-myapp.hajek.click");
-assert.equal(publicUrlForContainer("t-composeapp"), "https://t-composeapp.hajek.click");
-assert.equal(publicUrlForContainer("compose-app-web-1"), undefined);
-assert.equal(publicUrlForContainer("t-compose-app-web-1"), undefined);
-assert.equal(publicUrlForContainer("t-App"), undefined);
+// Routing is port-encoded: pi-<hostPort>.hajek.click proxies to 127.0.0.1:<port>.
+// Container names are irrelevant, which is why nothing is pinned in compose.
+assert.equal(publicUrlForPort(5553), "https://pi-5553.hajek.click");
+assert.equal(publicUrlForPort("8080"), "https://pi-8080.hajek.click");
 
-assert.equal(routableContainerName("compose-app"), "t-composeapp");
-assert.equal(routableContainerName("dockerfile-app"), "t-dockerfileapp");
-assert.equal(routableContainerName("My_App.v2"), "t-myappv2");
+assert.deepEqual(
+	publicUrlsForContainer([{ publicPort: 5553 }, { publicPort: 5553 }, { publicPort: 8080 }]),
+	["https://pi-5553.hajek.click", "https://pi-8080.hajek.click"],
+	"duplicate host ports collapse to one URL each",
+);
+assert.deepEqual(publicUrlsForContainer([{}]), [], "an unpublished port yields no URL");
+assert.deepEqual(publicUrlsForContainer(null), []);
 
 console.log(`OK — ${tools.length} tools, ${commands.length} commands, ${renderers.length} renderers`);
 console.log(`  tools:    ${toolNames.join(", ")}`);

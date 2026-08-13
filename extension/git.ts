@@ -25,6 +25,16 @@ async function git(cwd: string, args: string[], signal?: AbortSignal): Promise<s
 			signal,
 			timeout: 30_000,
 			maxBuffer: 4 * 1024 * 1024,
+			env: {
+				...process.env,
+				// Never block on an interactive credential prompt. A hidden prompt
+				// on a network operation such as ls-remote would hang the deploy
+				// with no visible cause; failing fast turns it into a warning.
+				GIT_TERMINAL_PROMPT: "0",
+				GIT_ASKPASS: "",
+				SSH_ASKPASS: "",
+				GIT_SSH_COMMAND: "ssh -oBatchMode=yes -oStrictHostKeyChecking=accept-new",
+			},
 		});
 		return stdout.trim();
 	} catch (error) {
@@ -88,38 +98,58 @@ export async function isDirty(cwd: string, signal?: AbortSignal): Promise<boolea
 	}
 }
 
-/** True when `branch` exists on the remote — Arcane can only clone what's pushed. */
-export async function branchExistsOnRemote(
-	cwd: string,
-	branch: string,
-	remote = "origin",
-	signal?: AbortSignal,
-): Promise<boolean> {
-	try {
-		const out = await git(cwd, ["ls-remote", "--heads", remote, branch], signal);
-		return out.length > 0;
-	} catch {
-		return false;
-	}
+/**
+ * Whether the remote has the branch.
+ *
+ * `unknown` is deliberately distinct from `absent`: `git ls-remote` fails for
+ * auth and network reasons too (no SSH agent, no token, offline), and treating
+ * that as "not pushed" would tell people to push work they already pushed.
+ * Only a successful query that lists nothing means the branch is really gone.
+ */
+export type RemoteBranchState = "present" | "absent" | "unknown";
+
+export interface RemoteBranchStatus {
+	state: RemoteBranchState;
+	/** Commit the remote has for the branch, when it could be read. */
+	remoteCommit?: string;
+	/** Local commit for the branch. */
+	localCommit?: string;
+	/** True only when both commits are known and equal. */
+	upToDate?: boolean;
+	/** Why the query failed, when `state` is `"unknown"`. */
+	error?: string;
 }
 
-/** True when local HEAD matches the remote tracking branch. */
-export async function isBranchPushed(
+/**
+ * Query the remote for `branch` and compare it with the local tip.
+ *
+ * One `ls-remote` gives both existence and the remote SHA, so this replaces a
+ * separate "exists" and "is pushed" pair of network calls.
+ */
+export async function checkRemoteBranch(
 	cwd: string,
 	branch: string,
 	remote = "origin",
 	signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<RemoteBranchStatus> {
+	const localCommit = await git(cwd, ["rev-parse", branch], signal).catch(() => undefined);
+
+	let listing: string;
 	try {
-		const [local, remoteLine] = await Promise.all([
-			git(cwd, ["rev-parse", branch], signal),
-			git(cwd, ["ls-remote", "--heads", remote, branch], signal),
-		]);
-		const remoteSha = remoteLine.split(/\s+/)[0];
-		return Boolean(remoteSha) && remoteSha === local;
-	} catch {
-		return false;
+		listing = await git(cwd, ["ls-remote", "--heads", remote, branch], signal);
+	} catch (error) {
+		return { state: "unknown", localCommit, error: (error as Error).message };
 	}
+
+	if (listing.trim().length === 0) return { state: "absent", localCommit };
+
+	const remoteCommit = listing.split(/\s+/)[0];
+	return {
+		state: "present",
+		remoteCommit,
+		localCommit,
+		upToDate: Boolean(localCommit) && localCommit === remoteCommit,
+	};
 }
 
 export interface ParsedGitUrl {

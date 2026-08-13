@@ -28,10 +28,10 @@ export const DEFAULT_CONTAINER_PORT = "80";
 export const PUBLIC_DOMAIN = "hajek.click";
 
 /**
- * Prefix the nginx vhost on the Docker host matches (`t-*.hajek.click` →
- * `http://<name>:5553`). See plan phase 9.4, option A.
+ * Hostname prefix the routing vhost matches: `pi-<hostPort>.hajek.click`.
+ * See `nginx/pi-arcane.conf` and the note on `publicUrlForPort`.
  */
-export const PUBLIC_HOST_PREFIX = "t-";
+export const PUBLIC_HOST_PREFIX = "pi-";
 
 export interface ArcaneDefaults {
 	autoSync?: boolean;

@@ -6,7 +6,7 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { publicUrlForContainer, requireRuntime } from "../runtime.ts";
+import { publicUrlsForContainer, requireRuntime } from "../runtime.ts";
 
 export const STATUS_ENTRY_TYPE = "arcane-status";
 
@@ -14,6 +14,7 @@ export interface StatusEntryData {
 	host: string;
 	environmentId: string;
 	environmentName?: string;
+	environmentStatus?: string;
 	projects: Array<{
 		name: string;
 		status: string;
@@ -37,16 +38,19 @@ export async function runStatus(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	try {
 		const { client, environmentId, environmentName, config } = await requireRuntime(ctx);
 
-		const [projects, syncs, containers] = await Promise.all([
+		const [projects, syncs, containers, environment] = await Promise.all([
 			client.listProjects(environmentId),
 			client.listGitOpsSyncs(environmentId),
 			client.listContainers(environmentId),
+			// Non-fatal: the dashboard still renders without the environment row.
+			client.getEnvironment(environmentId).catch(() => undefined),
 		]);
 
 		const data: StatusEntryData = {
 			host: config.host,
 			environmentId,
-			environmentName,
+			environmentName: environment?.name ?? environmentName,
+			environmentStatus: environment?.status,
 			projects: projects.map((project) => ({
 				name: project.name,
 				status: project.status,
@@ -71,7 +75,10 @@ export async function runStatus(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 						.filter((p) => p.publicPort)
 						.map((p) => `${p.publicPort}->${p.privatePort}`)
 						.join(","),
-					url: container.state === "running" ? publicUrlForContainer(name) : undefined,
+					url:
+						container.state === "running"
+							? publicUrlsForContainer(container.ports)[0]
+							: undefined,
 				};
 			}),
 		};

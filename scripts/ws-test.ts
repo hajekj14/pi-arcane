@@ -50,6 +50,8 @@ interface TestServer {
 async function startServer(
 	onUpgrade: (socket: Duplex) => void,
 	rejectWith?: number,
+	/** Return a bogus accept token, as a re-keying proxy does. */
+	mangleAccept = false,
 ): Promise<TestServer> {
 	const state: TestServer = { server: undefined as never, port: 0, lastHeaders: {} };
 
@@ -78,9 +80,11 @@ async function startServer(
 		}
 
 		const key = req.headers["sec-websocket-key"] as string;
-		const accept = createHash("sha1")
-			.update(key + WS_GUID)
-			.digest("base64");
+		const accept = mangleAccept
+			? createHash("sha1").update(`different-key${WS_GUID}`).digest("base64")
+			: createHash("sha1")
+					.update(key + WS_GUID)
+					.digest("base64");
 		socket.write(
 			[
 				"HTTP/1.1 101 Switching Protocols",
@@ -233,4 +237,39 @@ async function startServer(
 	test.server.close();
 }
 
-console.log("OK — websocket client: framing, fragmentation, limits, close, reject, abort");
+// --- 8. Re-keying proxy: mismatched accept ---------------------------------
+// Arcane sits behind a proxy that returns an accept token derived from its own
+// key. The stream is perfectly usable, so the default must be to carry on and
+// report the mismatch — but a caller that asks for strictness still gets it.
+{
+	const test = await startServer(
+		(socket) => {
+			socket.write(textFrame("log line from behind a proxy"));
+			const close = Buffer.alloc(2);
+			close.writeUInt16BE(1000, 0);
+			socket.write(frame(0x8, close));
+		},
+		undefined,
+		true,
+	);
+
+	const lenient = await collectWebSocketMessages(`ws://127.0.0.1:${test.port}/logs`, {
+		timeoutMs: 5000,
+	});
+	assert.deepEqual(lenient.messages, ["log line from behind a proxy"]);
+	assert.equal(lenient.acceptMismatch, true, "the mismatch is still reported");
+
+	await assert.rejects(
+		() =>
+			collectWebSocketMessages(`ws://127.0.0.1:${test.port}/logs`, {
+				timeoutMs: 5000,
+				requireAcceptMatch: true,
+			}),
+		(error: unknown) => error instanceof WebSocketError,
+	);
+	test.server.close();
+}
+
+console.log(
+	"OK — websocket client: framing, fragmentation, limits, close, reject, abort, proxy re-key",
+);
