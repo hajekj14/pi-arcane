@@ -1,0 +1,10 @@
+# Sensitive config — contains the Arcane API key
+.pi/arcane.json
+arcane.json
+
+# Pi sessions
+.pi/sessions/
+
+# Node
+node_modules/
+extension/node_modules/
