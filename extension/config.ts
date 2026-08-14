@@ -12,7 +12,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { SyncTargetType } from "./types.ts";
+import type { DeployShape } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,21 +34,46 @@ export const PUBLIC_DOMAIN = "hajek.click";
 export const PUBLIC_HOST_PREFIX = "pi-";
 
 export interface ArcaneDefaults {
-	autoSync?: boolean;
-	syncInterval?: number;
 	composePath?: string;
-	targetType?: SyncTargetType;
+	targetType?: DeployShape;
 	projectName?: string;
-	syncName?: string;
 	/** `"HOST:CONTAINER"`, e.g. `"8080:80"`. Defaults to `"5553:80"`. */
 	portMapping?: string;
 }
+
+/**
+ * The upload sidecar every deploy pushes through.
+ *
+ * `url` is the sidecar's public base URL; `containerPath` is where the same
+ * files appear inside the Arcane container, which is what a build's
+ * `contextDir` must point at. See `upload-server/docker-compose.yml`.
+ */
+export interface UploadConfig {
+	url: string;
+	/** Bearer token. Defaults to the Arcane API key, which the sidecar shares. */
+	token: string;
+	/** Absolute path of the upload root as Arcane sees it. */
+	containerPath: string;
+	/**
+	 * Volume holding `containerPath`, used to delete files the sidecar cannot
+	 * (it has no DELETE). Discovered from the Arcane container's mounts when
+	 * omitted.
+	 */
+	volumeName?: string;
+	/** Reject files larger than this before uploading. Default 256 MiB. */
+	maxFileBytes: number;
+}
+
+export type RawUploadConfig = Partial<Omit<UploadConfig, "maxFileBytes">> & {
+	maxFileBytes?: number;
+};
 
 /** Shape of `arcane.json` on disk, before any interpolation. */
 export interface RawArcaneConfig {
 	host?: string;
 	apiKey?: string;
 	environmentId?: string;
+	upload?: RawUploadConfig;
 	defaults?: ArcaneDefaults;
 }
 
@@ -58,10 +83,18 @@ export interface ArcaneConfig {
 	host: string;
 	apiKey: string;
 	environmentId?: string;
+	/** Undefined when no sidecar is configured — deploys cannot run without it. */
+	upload?: UploadConfig;
 	defaults: ArcaneDefaults;
 	/** File the config came from, or `undefined` when built from the environment. */
 	sourcePath?: string;
 }
+
+/** Matches `-max_upload_size` in the sidecar and `client_max_body_size` in nginx. */
+export const DEFAULT_MAX_FILE_BYTES = 256 * 1024 * 1024;
+
+/** Where uploaded contexts live inside the Arcane container, by default. */
+export const DEFAULT_UPLOAD_CONTAINER_PATH = "/app/data/pi-arcane";
 
 export class ConfigError extends Error {
 	constructor(message: string) {
@@ -208,10 +241,12 @@ export async function loadConfig(cwd: string): Promise<ArcaneConfig | undefined>
 				`${path} has no "apiKey" and ARCANE_API_KEY is not set. Run /arcane-setup.`,
 			);
 		}
+		const apiKey = await resolveSecret(apiKeyRaw);
 		return {
 			host: normalizeHost(raw.host ?? DEFAULT_HOST),
-			apiKey: await resolveSecret(apiKeyRaw),
+			apiKey,
 			environmentId: raw.environmentId,
+			upload: await resolveUploadConfig(raw.upload, apiKey),
 			defaults: raw.defaults ?? {},
 			sourcePath: path,
 		};
@@ -224,11 +259,34 @@ export async function loadConfig(cwd: string): Promise<ArcaneConfig | undefined>
 			host: normalizeHost(process.env.ARCANE_HOST ?? DEFAULT_HOST),
 			apiKey: process.env.ARCANE_API_KEY,
 			environmentId: process.env.ARCANE_ENVIRONMENT_ID,
+			upload: await resolveUploadConfig(
+				process.env.ARCANE_UPLOAD_URL ? { url: process.env.ARCANE_UPLOAD_URL } : undefined,
+				process.env.ARCANE_API_KEY,
+			),
 			defaults: {},
 		};
 	}
 
 	return undefined;
+}
+
+/**
+ * Fill in the upload block. The token defaults to the Arcane API key because the
+ * sidecar is deployed with that same credential (see plan-upload.md §7.2), so a
+ * working config needs nothing but the sidecar's URL.
+ */
+async function resolveUploadConfig(
+	raw: RawUploadConfig | undefined,
+	apiKey: string,
+): Promise<UploadConfig | undefined> {
+	if (!raw?.url) return undefined;
+	return {
+		url: raw.url.replace(/\/+$/, ""),
+		token: raw.token ? await resolveSecret(raw.token, "upload.token") : apiKey,
+		containerPath: (raw.containerPath ?? DEFAULT_UPLOAD_CONTAINER_PATH).replace(/\/+$/, ""),
+		volumeName: raw.volumeName,
+		maxFileBytes: raw.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
+	};
 }
 
 /**

@@ -16,8 +16,10 @@ import {
 	loadConfig,
 	writeConfigPatch,
 	type ArcaneConfig,
+	type UploadConfig,
 } from "./config.ts";
 import type { Environment } from "./types.ts";
+import { resetUploadCache } from "./upload.ts";
 
 export interface ArcaneRuntime {
 	config: ArcaneConfig;
@@ -44,6 +46,7 @@ export function resetRuntime(): void {
 	cachedClient = undefined;
 	cachedEnvironmentId = undefined;
 	cachedEnvironmentName = undefined;
+	resetUploadCache();
 }
 
 /** Load and cache the config, or throw a message pointing at `/arcane-setup`. */
@@ -159,6 +162,36 @@ export async function requireRuntime(ctx: ExtensionContext): Promise<ArcaneRunti
 	const client = await requireClient(ctx);
 	const environmentId = await requireEnvironmentId(ctx);
 	return { config, client, environmentId, environmentName: cachedEnvironmentName };
+}
+
+/** The upload sidecar, or `undefined` when none is configured. */
+export async function optionalUpload(ctx: ExtensionContext): Promise<UploadConfig | undefined> {
+	return (await requireConfig(ctx)).upload;
+}
+
+/**
+ * The upload sidecar, or a message explaining how to get one.
+ *
+ * Every deploy goes through it — Arcane builds from a directory on its own
+ * filesystem, and the sidecar is what puts the working tree there — so this is
+ * a hard requirement rather than a fallback.
+ */
+export async function requireUpload(ctx: ExtensionContext): Promise<UploadConfig> {
+	const config = await requireConfig(ctx);
+	if (config.upload) return config.upload;
+
+	throw new ArcaneSetupError(
+		[
+			"No upload sidecar is configured, and deploys upload the working tree rather than",
+			"cloning it from git.",
+			"",
+			`Add to ${config.sourcePath ?? configSearchPaths(ctx.cwd)[0]}:`,
+			'  "upload": { "url": "https://pump.example.com" }',
+			"",
+			"The token defaults to the Arcane API key. Deploy the sidecar itself with",
+			"upload-server/docker-compose.yml if it is not running yet.",
+		].join("\n"),
+	);
 }
 
 /** Reflect a freshly written config without re-reading it from disk. */

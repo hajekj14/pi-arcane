@@ -62,140 +62,40 @@ export interface Environment {
 }
 
 // ---------------------------------------------------------------------------
-// Git repositories (global, under /customize/git-repositories)
+// Volume browsing (how uploaded build contexts are inspected and pruned)
 // ---------------------------------------------------------------------------
 
-export type GitAuthType = "none" | "token" | "ssh";
-
-export interface GitRepository {
-	id: string;
+/** One entry from `GET /environments/{id}/volumes/{name}/browse`. */
+export interface VolumeFileEntry {
 	name: string;
-	url: string;
-	authType: string;
-	enabled: boolean;
-	createdAt: string;
-	updatedAt: string;
-	description?: string;
-	username?: string;
-	sshHostKeyVerification?: string;
+	path: string;
+	size: number;
+	isDirectory: boolean;
+	isSymlink: boolean;
+	mode?: string;
+	/** Uploaded files report the zero time; never use it for change detection. */
+	modTime?: string;
+	linkTarget?: string;
 }
 
-export interface CreateGitRepositoryRequest {
-	name: string;
-	url: string;
-	authType: GitAuthType;
-	token?: string;
-	username?: string;
-	sshKey?: string;
-	sshHostKeyVerification?: string;
-	description?: string;
-	enabled?: boolean;
+/** One mount of a container, as reported by `GET .../containers/{id}`. */
+export interface ContainerMount {
+	type: string;
+	destination: string;
+	source?: string;
+	name?: string;
+	rw?: boolean;
 }
 
-export type UpdateGitRepositoryRequest = Partial<CreateGitRepositoryRequest>;
+// ---------------------------------------------------------------------------
+// Deploy shapes
+// ---------------------------------------------------------------------------
 
 /**
- * A whole repository record as `POST /git-repositories/sync` expects them —
- * the endpoint takes objects, not IDs. Credentials are optional.
+ * What the uploaded tree turns into: a compose project built from the uploaded
+ * context, or a single image plus a generated one-service compose project.
  */
-export interface RepositorySync extends GitRepository {
-	token?: string;
-	sshKey?: string;
-}
-
-export interface BranchInfo {
-	name: string;
-	isDefault: boolean;
-}
-
-export interface BranchesResponse {
-	branches: BranchInfo[] | null;
-}
-
-/** One entry when browsing a repository's tree. */
-export interface FileTreeNode {
-	name?: string;
-	path?: string;
-	type?: string;
-	isDirectory?: boolean;
-	size?: number;
-}
-
-/** Arcane has used both key names for the listing, so accept either. */
-export interface BrowseResponse {
-	entries?: FileTreeNode[] | null;
-	files?: FileTreeNode[] | null;
-	path?: string;
-}
-
-// ---------------------------------------------------------------------------
-// GitOps syncs
-// ---------------------------------------------------------------------------
-
-export type SyncTargetType = "compose" | "container";
-
-export interface GitOpsSync {
-	id: string;
-	name: string;
-	environmentId: string;
-	repositoryId: string;
-	branch: string;
-	composePath: string;
-	projectName: string;
-	targetType: string;
-	autoSync: boolean;
-	syncInterval: number;
-	syncDirectory: boolean;
-	createdAt: string;
-	updatedAt: string;
-	projectId?: string;
-	lastSyncAt?: string;
-	lastSyncCommit?: string;
-	lastSyncError?: string;
-	lastSyncStatus?: string;
-	syncedFiles?: string;
-	repository?: GitRepository;
-	preDeployScriptPath?: string;
-}
-
-export interface CreateSyncRequest {
-	name: string;
-	repositoryId: string;
-	branch: string;
-	composePath: string;
-	projectName?: string;
-	targetType?: SyncTargetType;
-	autoSync?: boolean;
-	syncInterval?: number;
-	syncDirectory?: boolean;
-	preDeployScriptPath?: string;
-	preDeployTimeoutSec?: number;
-}
-
-export type UpdateSyncRequest = Partial<CreateSyncRequest>;
-
-export interface SyncResult {
-	success: boolean;
-	message: string;
-	syncedAt: string;
-	error?: string;
-}
-
-export interface SyncStatus {
-	id: string;
-	autoSync: boolean;
-	lastSyncAt?: string;
-	lastSyncCommit?: string;
-	lastSyncError?: string;
-	lastSyncStatus?: string;
-	nextSyncAt?: string;
-}
-
-export interface SyncCounts {
-	totalSyncs: number;
-	activeSyncs: number;
-	successfulSyncs: number;
-}
+export type DeployShape = "compose" | "container";
 
 // ---------------------------------------------------------------------------
 // Projects
@@ -456,6 +356,8 @@ export interface ContainerDetails {
 	state: ContainerState;
 	ports: ContainerPort[] | null;
 	labels?: Record<string, string>;
+	/** Used to discover which volume backs the upload directory. */
+	mounts?: ContainerMount[] | null;
 	composeInfo?: {
 		projectName: string;
 		serviceName: string;
@@ -472,13 +374,14 @@ export interface DeploymentRecord {
 	timestamp: string;
 	environmentId: string;
 	projectName: string;
-	syncName?: string;
-	syncId?: string;
-	repositoryId?: string;
 	projectId?: string;
 	branch?: string;
 	composePath?: string;
-	targetType?: SyncTargetType;
+	targetType?: DeployShape;
+	/** Absolute path of the uploaded build context inside Arcane. */
+	contextPath?: string;
+	/** What the upload moved: files sent, removed, and skipped as unchanged. */
+	upload?: { uploaded: number; deleted: number; unchanged: number; bytes: number };
 	status: "success" | "failed";
 	error?: string;
 	urls?: string[];

@@ -14,35 +14,23 @@ import {
 	type ActivityDetail,
 	type BaseApiResponse,
 	type BasePaginated,
-	type BranchesResponse,
-	type BranchInfo,
-	type BrowseResponse,
 	type BuildProjectRequest,
 	type BuildRequest,
 	type ContainerDetails,
 	type ContainerListResponse,
 	type ContainerSummary,
 	type DashboardSnapshot,
-	type CreateGitRepositoryRequest,
 	type CreateProjectRequest,
 	type CreateProjectResponse,
-	type CreateSyncRequest,
 	type DeployOptions,
 	type DestroyOptions,
 	type Environment,
 	type ErrorModel,
-	type FileTreeNode,
-	type GitOpsSync,
-	type GitRepository,
 	type ImageBuildRecord,
 	type MessageResponse,
 	type ProjectDetails,
-	type RepositorySync,
-	type SyncResult,
-	type SyncStatus,
-	type UpdateGitRepositoryRequest,
 	type UpdateProjectRequest,
-	type UpdateSyncRequest,
+	type VolumeFileEntry,
 } from "./types.ts";
 
 export class ArcaneApiError extends Error {
@@ -335,93 +323,6 @@ export class ArcaneClient {
 	}
 
 	// -----------------------------------------------------------------------
-	// Git repositories
-	// -----------------------------------------------------------------------
-
-	listRepositories(signal?: AbortSignal): Promise<GitRepository[]> {
-		return this.requestAllPages<GitRepository>("/customize/git-repositories", { signal });
-	}
-
-	createRepository(
-		req: CreateGitRepositoryRequest,
-		signal?: AbortSignal,
-	): Promise<GitRepository> {
-		return this.request<GitRepository>("POST", "/customize/git-repositories", {
-			body: req,
-			signal,
-		});
-	}
-
-	getRepository(id: string, signal?: AbortSignal): Promise<GitRepository> {
-		return this.request<GitRepository>("GET", `/customize/git-repositories/${enc(id)}`, { signal });
-	}
-
-	updateRepository(
-		id: string,
-		req: UpdateGitRepositoryRequest,
-		signal?: AbortSignal,
-	): Promise<GitRepository> {
-		return this.request<GitRepository>("PUT", `/customize/git-repositories/${enc(id)}`, {
-			body: req,
-			signal,
-		});
-	}
-
-	deleteRepository(id: string, signal?: AbortSignal): Promise<void> {
-		return this.request<void>("DELETE", `/customize/git-repositories/${enc(id)}`, { signal });
-	}
-
-	/** Verify Arcane can reach and authenticate against the repo. */
-	testRepository(id: string, branch?: string, signal?: AbortSignal): Promise<MessageResponse> {
-		return this.request<MessageResponse>("POST", `/customize/git-repositories/${enc(id)}/test`, {
-			query: { branch },
-			signal,
-			timeoutMs: 90_000,
-		});
-	}
-
-	/**
-	 * Browse a repository's tree without cloning it, so a deploy can confirm the
-	 * compose path exists on the branch Arcane will actually read.
-	 */
-	async browseFiles(
-		id: string,
-		path?: string,
-		branch?: string,
-		signal?: AbortSignal,
-	): Promise<FileTreeNode[]> {
-		const res = await this.request<BrowseResponse>(
-			"GET",
-			`/customize/git-repositories/${enc(id)}/files`,
-			{ query: { path, branch }, signal, timeoutMs: 90_000 },
-		);
-		return res.entries ?? res.files ?? [];
-	}
-
-	/**
-	 * Push a set of repository definitions into Arcane.
-	 *
-	 * The endpoint takes whole repository objects, not IDs — pass records from
-	 * `listRepositories()` (optionally with `token`/`sshKey` filled in).
-	 */
-	syncRepositories(repositories: RepositorySync[], signal?: AbortSignal): Promise<MessageResponse> {
-		return this.request<MessageResponse>("POST", "/git-repositories/sync", {
-			body: { repositories },
-			signal,
-			timeoutMs: 5 * 60_000,
-		});
-	}
-
-	async listBranches(id: string, signal?: AbortSignal): Promise<BranchInfo[]> {
-		const res = await this.request<BranchesResponse>(
-			"GET",
-			`/customize/git-repositories/${enc(id)}/branches`,
-			{ signal, timeoutMs: 90_000 },
-		);
-		return res.branches ?? [];
-	}
-
-	// -----------------------------------------------------------------------
 	// Environments
 	// -----------------------------------------------------------------------
 
@@ -436,71 +337,6 @@ export class ArcaneClient {
 	/** Aggregate counts and action items for the environment. */
 	getDashboard(id: string, signal?: AbortSignal): Promise<DashboardSnapshot> {
 		return this.request<DashboardSnapshot>("GET", `/environments/${enc(id)}/dashboard`, { signal });
-	}
-
-	// -----------------------------------------------------------------------
-	// GitOps syncs
-	// -----------------------------------------------------------------------
-
-	listGitOpsSyncs(envId: string, signal?: AbortSignal): Promise<GitOpsSync[]> {
-		return this.requestAllPages<GitOpsSync>(`/environments/${enc(envId)}/gitops-syncs`, { signal });
-	}
-
-	createGitOpsSync(
-		envId: string,
-		req: CreateSyncRequest,
-		signal?: AbortSignal,
-	): Promise<GitOpsSync> {
-		return this.request<GitOpsSync>("POST", `/environments/${enc(envId)}/gitops-syncs`, {
-			body: req,
-			signal,
-		});
-	}
-
-	getGitOpsSync(envId: string, syncId: string, signal?: AbortSignal): Promise<GitOpsSync> {
-		return this.request<GitOpsSync>(
-			"GET",
-			`/environments/${enc(envId)}/gitops-syncs/${enc(syncId)}`,
-			{ signal },
-		);
-	}
-
-	updateGitOpsSync(
-		envId: string,
-		syncId: string,
-		req: UpdateSyncRequest,
-		signal?: AbortSignal,
-	): Promise<GitOpsSync> {
-		return this.request<GitOpsSync>(
-			"PUT",
-			`/environments/${enc(envId)}/gitops-syncs/${enc(syncId)}`,
-			{ body: req, signal },
-		);
-	}
-
-	deleteGitOpsSync(envId: string, syncId: string, signal?: AbortSignal): Promise<MessageResponse> {
-		return this.request<MessageResponse>(
-			"DELETE",
-			`/environments/${enc(envId)}/gitops-syncs/${enc(syncId)}`,
-			{ signal },
-		);
-	}
-
-	/** Pull the repo and apply it. Long-running: allow several minutes. */
-	syncNow(envId: string, syncId: string, signal?: AbortSignal): Promise<SyncResult> {
-		return this.request<SyncResult>(
-			"POST",
-			`/environments/${enc(envId)}/gitops-syncs/${enc(syncId)}/sync`,
-			{ signal, timeoutMs: 15 * 60_000 },
-		);
-	}
-
-	getSyncStatus(envId: string, syncId: string, signal?: AbortSignal): Promise<SyncStatus> {
-		return this.request<SyncStatus>(
-			"GET",
-			`/environments/${enc(envId)}/gitops-syncs/${enc(syncId)}/status`,
-			{ signal },
-		);
 	}
 
 	// -----------------------------------------------------------------------
@@ -759,6 +595,41 @@ export class ArcaneClient {
 			"GET",
 			`/environments/${enc(envId)}/containers/${enc(containerId)}`,
 			{ signal },
+		);
+	}
+
+	// -----------------------------------------------------------------------
+	// Volume browsing
+	//
+	// The upload sidecar owns writes; these cover what it cannot do — listing an
+	// uploaded context and deleting files that have left the working tree, since
+	// the sidecar exposes no DELETE.
+	// -----------------------------------------------------------------------
+
+	listVolumeFiles(
+		envId: string,
+		volume: string,
+		path: string,
+		signal?: AbortSignal,
+	): Promise<VolumeFileEntry[]> {
+		return this.request<VolumeFileEntry[]>(
+			"GET",
+			`/environments/${enc(envId)}/volumes/${enc(volume)}/browse`,
+			{ query: { path }, signal },
+		);
+	}
+
+	/** Recursive: removing a directory removes everything under it. */
+	deleteVolumePath(
+		envId: string,
+		volume: string,
+		path: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		return this.request<void>(
+			"DELETE",
+			`/environments/${enc(envId)}/volumes/${enc(volume)}/browse`,
+			{ query: { path }, signal, timeoutMs: 2 * 60_000 },
 		);
 	}
 

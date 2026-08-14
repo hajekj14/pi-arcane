@@ -3,18 +3,22 @@
  *
  * Drives the actual `arcane_*` tools — the same code path the model uses —
  * against both fixtures, then verifies over HTTP that the deployed page really
- * serves the content that is in git.
+ * serves what is on disk.
+ *
+ * The decisive check is the uncommitted one: each fixture gets an untracked
+ * marker file that exists nowhere in git, and the deployed site must serve it.
+ * That is what proves the deploy came from the working tree rather than a clone.
  *
  * Credentials come from the same place the extension reads them: ARCANE_API_KEY,
- * or an `arcane.json` found by the normal resolution order. Set `GITHUB_TOKEN`
- * as well if this repository is private, so Arcane can clone it.
+ * or an `arcane.json` found by the normal resolution order. The config must also
+ * carry `upload.url`, since deploys push the tree through the upload sidecar.
  *
  * Run with:
  *   node --experimental-strip-types scripts/e2e.ts [compose|dockerfile]
  */
 
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -49,6 +53,18 @@ if (!preflight) {
 console.log(
 	`Auth:   ${preflight.sourcePath ? `arcane.json (${preflight.sourcePath})` : "ARCANE_API_KEY"}`,
 );
+
+if (!preflight.upload) {
+	console.error(
+		[
+			"No upload sidecar configured, and every deploy uploads the working tree.",
+			`Add to ${preflight.sourcePath ?? configSearchPaths(repoRoot)[0]}:`,
+			'  "upload": { "url": "https://pump.example.com" }',
+		].join("\n"),
+	);
+	process.exit(2);
+}
+console.log(`Upload: ${preflight.upload.url} -> ${preflight.upload.containerPath}`);
 
 // --- stub extension host ----------------------------------------------------
 
@@ -208,65 +224,106 @@ for (const fixture of selected) {
 	console.log(`\n=== ${fixture.key} (${fixture.projectName}) ===`);
 	resetRuntime();
 
-	// 1. Deploy ---------------------------------------------------------------
-	let deployOutput = "";
-	let deployDetails: any;
+	// 0. Plant an uncommitted marker ------------------------------------------
+	// Untracked and never committed, so serving it can only mean the deploy came
+	// from the working tree. Removed again in the finally below, whatever happens.
+	const stamp = new Date().toISOString();
+	const markerName = "uncommitted-marker.html";
+	const markerFile = join(fixture.dir, "www", markerName);
+	const markerText = `working tree ${stamp}`;
+	await writeFile(markerFile, `<!DOCTYPE html>\n<html><body><h1>${markerText}</h1></body></html>\n`, "utf8");
+
 	try {
-		const deployed = await runTool(
-			deployTool,
-			{ project_name: fixture.projectName, branch },
-			fixture.dir,
+		// 1. Deploy -------------------------------------------------------------
+		let deployOutput = "";
+		let deployDetails: any;
+		try {
+			const deployed = await runTool(deployTool, { project_name: fixture.projectName }, fixture.dir);
+			deployOutput = deployed.text;
+			deployDetails = deployed.details;
+			record(fixture.key, "arcane_deploy", true);
+		} catch (error) {
+			record(fixture.key, "arcane_deploy", false, (error as Error).message);
+			console.log((error as Error).message);
+			continue;
+		}
+		console.log(indent(deployOutput));
+
+		// 2. Verify over HTTP ---------------------------------------------------
+		const endpoints: any[] = deployDetails?.endpoints ?? [];
+		const url: string | undefined = endpoints.flatMap((e: any) => e.urls ?? [])[0];
+		if (!url) {
+			record(
+				fixture.key,
+				"deploy reported a public URL",
+				false,
+				"no container published a host port",
+			);
+			continue;
+		}
+		const expected = await readFile(fixture.htmlPath, "utf8");
+		const marker = extractMarker(expected) ?? fixture.marker;
+
+		console.log(`  probing ${url} for ${JSON.stringify(marker)} ...`);
+		const probe = await waitForContent(url, marker);
+		record(
+			fixture.key,
+			`serves the fixture page at ${url}`,
+			probe.ok,
+			probe.error ?? `HTTP ${probe.status}, body did not contain the marker`,
 		);
-		deployOutput = deployed.text;
-		deployDetails = deployed.details;
-		record(fixture.key, "arcane_deploy", true);
-	} catch (error) {
-		record(fixture.key, "arcane_deploy", false, (error as Error).message);
-		console.log((error as Error).message);
-		continue;
-	}
-	console.log(indent(deployOutput));
+		if (!probe.ok && probe.body) console.log(indent(probe.body.slice(0, 300)));
 
-	// 2. Verify over HTTP -----------------------------------------------------
-	const endpoints: any[] = deployDetails?.endpoints ?? [];
-	const url: string | undefined = endpoints.flatMap((e: any) => e.urls ?? [])[0];
-	if (!url) {
-		record(fixture.key, "deploy reported a public URL", false, "no container published a host port");
-		continue;
-	}
-	const expected = await readFile(fixture.htmlPath, "utf8");
-	const marker = extractMarker(expected) ?? fixture.marker;
+		// 3. The uncommitted file must be live ----------------------------------
+		const markerUrl = `${url}/${markerName}`;
+		console.log(`  probing ${markerUrl} for the uncommitted marker ...`);
+		const markerProbe = await waitForContent(markerUrl, markerText, 60_000);
+		record(
+			fixture.key,
+			"serves an uncommitted, untracked file (working tree, not git)",
+			markerProbe.ok,
+			markerProbe.error ?? `HTTP ${markerProbe.status}`,
+		);
 
-	console.log(`  probing ${url} for ${JSON.stringify(marker)} ...`);
-	const probe = await waitForContent(url, marker);
-	record(
-		fixture.key,
-		`serves committed HTML at ${url}`,
-		probe.ok,
-		probe.error ?? `HTTP ${probe.status}, body did not contain the marker`,
-	);
-	if (!probe.ok && probe.body) console.log(indent(probe.body.slice(0, 300)));
+		// 4. A second deploy must re-upload almost nothing -----------------------
+		try {
+			const again = await runTool(deployTool, { project_name: fixture.projectName }, fixture.dir);
+			const upload = again.details?.upload;
+			record(
+				fixture.key,
+				`redeploy is incremental (${upload?.uploaded ?? "?"} sent, ${upload?.unchanged ?? "?"} unchanged)`,
+				upload !== undefined && upload.uploaded === 0 && upload.unchanged > 0,
+				JSON.stringify(upload),
+			);
+		} catch (error) {
+			record(fixture.key, "incremental redeploy", false, (error as Error).message);
+		}
 
-	// 3. Status ---------------------------------------------------------------
-	try {
-		const status = (await runTool(statusTool, { project_name: fixture.projectName }, fixture.dir))
-			.text;
-		const running = /status=running/i.test(status) || /● /.test(status);
-		record(fixture.key, "arcane_status reports the project", running, status.slice(0, 300));
-		console.log(indent(status));
-	} catch (error) {
-		record(fixture.key, "arcane_status", false, (error as Error).message);
-	}
+		// 5. Status --------------------------------------------------------------
+		try {
+			const status = (await runTool(statusTool, { project_name: fixture.projectName }, fixture.dir))
+				.text;
+			const running = /status=running/i.test(status) || /● /.test(status);
+			record(fixture.key, "arcane_status reports the project", running, status.slice(0, 300));
+			console.log(indent(status));
+		} catch (error) {
+			record(fixture.key, "arcane_status", false, (error as Error).message);
+		}
 
-	// 4. Logs -----------------------------------------------------------------
-	try {
-		const logs = (
-			await runTool(logsTool, { project_name: fixture.projectName, tail: 50 }, fixture.dir)
-		).text;
-		record(fixture.key, "arcane_logs returns output", logs.length > 0, logs.slice(0, 200));
-		console.log(indent(logs.split("\n").slice(0, 12).join("\n")));
-	} catch (error) {
-		record(fixture.key, "arcane_logs", false, (error as Error).message);
+		// 6. Logs ------------------------------------------------------------------
+		try {
+			const logs = (
+				await runTool(logsTool, { project_name: fixture.projectName, tail: 50 }, fixture.dir)
+			).text;
+			record(fixture.key, "arcane_logs returns output", logs.length > 0, logs.slice(0, 200));
+			console.log(indent(logs.split("\n").slice(0, 12).join("\n")));
+		} catch (error) {
+			record(fixture.key, "arcane_logs", false, (error as Error).message);
+		}
+	} finally {
+		// Never leave the marker behind: it would show up as a dirty working tree
+		// and get uploaded by every later deploy.
+		await rm(markerFile, { force: true });
 	}
 }
 

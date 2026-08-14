@@ -3,15 +3,17 @@
  *
  * Destructive and not undoable, so it is deliberately narrow: it resolves one
  * unambiguous project, asks for confirmation when there is a UI, and never
- * touches volumes unless explicitly told to. The git repository record in
- * Arcane is always left alone — it is shared by every project cloned from that
- * repo, so removing it here would break unrelated deployments.
+ * touches volumes unless explicitly told to. It also removes the build context
+ * uploaded for the project, which would otherwise sit on the Arcane host
+ * indefinitely.
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
-import { requireRuntime } from "../runtime.ts";
-import type { GitOpsSync, ProjectDetails } from "../types.ts";
+import { readGitContext } from "../git.ts";
+import { optionalUpload, requireRuntime } from "../runtime.ts";
+import type { ProjectDetails } from "../types.ts";
+import { contextSlug, removeContext } from "../upload.ts";
 import { fields, toolError } from "./shared.ts";
 
 const parameters = Type.Object({
@@ -28,13 +30,13 @@ const parameters = Type.Object({
 	remove_files: Type.Optional(
 		Type.Boolean({
 			description:
-				"Also delete the project directory on the Arcane host. Default true, since a GitOps deploy can recreate it from git.",
+				"Also delete the project directory on the Arcane host. Default true, since the next deploy recreates it from the upload.",
 		}),
 	),
-	remove_sync: Type.Optional(
+	remove_context: Type.Optional(
 		Type.Boolean({
 			description:
-				"Also delete the GitOps sync feeding this project. Default true; leaving it would let the project reappear on the next sync.",
+				"Also delete the build context uploaded for this project. Default true; keeping it only wastes disk on the Arcane host.",
 		}),
 	),
 });
@@ -47,15 +49,14 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 		label: "Arcane Destroy",
 		description: [
 			"Tear down a deployed Arcane project: stop its containers, destroy the project,",
-			"and by default delete the GitOps sync that feeds it.",
+			"and by default delete the build context uploaded for it.",
 			"",
 			"This is destructive and cannot be undone. Volumes are kept unless remove_volumes",
-			"is set. The git repository registered in Arcane is never deleted, because other",
-			"projects may be deployed from it.",
+			"is set.",
 			"",
 			"Use arcane_list or arcane_status first if unsure of the exact project name.",
 		].join("\n"),
-		promptSnippet: "Destroy a deployed Arcane project and its GitOps sync",
+		promptSnippet: "Destroy a deployed Arcane project and its uploaded build context",
 		promptGuidelines: [
 			"Use arcane_destroy only when the user explicitly asks to delete, destroy, or tear down a deployment.",
 		],
@@ -73,7 +74,7 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 
 				const removeVolumes = params.remove_volumes ?? false;
 				const removeFiles = params.remove_files ?? true;
-				const removeSync = params.remove_sync ?? true;
+				const removeUploadedContext = params.remove_context ?? true;
 
 				// --- resolve exactly one project --------------------------------
 				const projects = await client.listProjects(environmentId, signal);
@@ -101,7 +102,9 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 						[
 							`Project ${project.name} (${project.id}) with ${project.serviceCount} service(s).`,
 							removeVolumes ? "Volumes AND THEIR DATA will be deleted." : "Volumes will be kept.",
-							removeSync ? "The GitOps sync will be deleted too." : "The GitOps sync will be kept.",
+							removeUploadedContext
+								? "The uploaded build context will be deleted too."
+								: "The uploaded build context will be kept.",
 							"This cannot be undone.",
 						].join("\n"),
 					);
@@ -111,22 +114,6 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 							details: { cancelled: true, projectName: project.name },
 						};
 					}
-				}
-
-				// --- delete the sync first ---------------------------------------
-				// Otherwise an autoSync poll could recreate the project moments after
-				// it is destroyed.
-				const removedSyncs: GitOpsSync[] = [];
-				if (removeSync) {
-					const syncs = await client.listGitOpsSyncs(environmentId, signal);
-					for (const sync of syncs) {
-						if (sync.projectId === project.id || sync.projectName === project.name) {
-							await client.deleteGitOpsSync(environmentId, sync.id, signal);
-							removedSyncs.push(sync);
-							step(`Deleted GitOps sync ${sync.name} (${sync.id}).`);
-						}
-					}
-					if (removedSyncs.length === 0) step("No GitOps sync referenced this project.");
 				}
 
 				// --- stop, then destroy -------------------------------------------
@@ -156,6 +143,23 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 					}
 				}
 
+				// --- remove the uploaded build context -----------------------------
+				// After the teardown, not before: deleting the context first would
+				// strand the build inputs if destroying the project then failed.
+				let contextNote = "kept";
+				if (removeUploadedContext) {
+					const upload = await optionalUpload(ctx);
+					if (!upload) {
+						contextNote = "skipped (no upload sidecar configured)";
+					} else {
+						const git = await readGitContext(ctx.cwd, signal);
+						const slug = contextSlug(git?.repoRoot ?? ctx.cwd, project.name);
+						const outcome = await removeContext(client, environmentId, upload, slug, signal);
+						contextNote = outcome.removed ? `deleted (${slug})` : `not deleted: ${outcome.reason}`;
+					}
+					step(`Uploaded context: ${contextNote}`);
+				}
+
 				// --- verify it is actually gone ------------------------------------
 				const remainingProjects = await client.listProjects(environmentId, signal);
 				const stillThere = remainingProjects.some((p) => p.id === project.id);
@@ -172,7 +176,7 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 						["projectId", project.id],
 						["volumes", removeVolumes ? "deleted" : "kept"],
 						["files", removeFiles ? "deleted" : "kept"],
-						["syncsDeleted", removedSyncs.length],
+						["uploadedContext", contextNote],
 					]),
 				];
 				if (strayContainers.length > 0) {
@@ -191,7 +195,7 @@ export function createDestroyTool(): ToolDefinition<typeof parameters> {
 					details: {
 						projectName: project.name,
 						projectId: project.id,
-						removedSyncs: removedSyncs.map((s) => ({ id: s.id, name: s.name })),
+						uploadedContext: contextNote,
 						removeVolumes,
 						removeFiles,
 					},

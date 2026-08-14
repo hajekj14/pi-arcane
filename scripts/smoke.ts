@@ -10,17 +10,16 @@ import assert from "node:assert/strict";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import arcaneExtension from "../extension/index.ts";
-import { generateCompose, prepareCompose, readComposeInfo } from "../extension/compose.ts";
 import {
-	checkRemoteBranch,
-	embedToken,
-	parseGitUrl,
-	redactUrl,
-	sanitizeName,
-} from "../extension/git.ts";
+	generateCompose,
+	prepareCompose,
+	readComposeInfo,
+	rewriteBuildContexts,
+} from "../extension/compose.ts";
+import { sanitizeName } from "../extension/git.ts";
 import { parsePortMapping, resolveSecret, normalizeHost } from "../extension/config.ts";
 import { publicUrlForPort, publicUrlsForContainer } from "../extension/runtime.ts";
-import { sameRepo, buildKitContext } from "../extension/repo.ts";
+import { collectFiles, contextSlug, formatBytes } from "../extension/upload.ts";
 
 const tools: any[] = [];
 const commands: Array<{ name: string; options: any }> = [];
@@ -61,59 +60,75 @@ assert.deepEqual(commands.map((c) => c.name).sort(), [
 assert.deepEqual(events.sort(), ["session_shutdown", "session_start"]);
 assert.deepEqual(renderers.sort(), ["arcane-deployment", "arcane-status"]);
 
-// --- git URL handling ------------------------------------------------------
-const ssh = parseGitUrl("git@github.com:hajekj14/pi-arcane.git");
-assert.equal(ssh?.kind, "ssh");
-assert.equal(ssh?.host, "github.com");
-assert.equal(ssh?.path, "hajekj14/pi-arcane");
-
-const https = parseGitUrl("https://github.com/hajekj14/pi-arcane.git");
-assert.equal(https?.kind, "https");
-assert.equal(https?.hasCredentials, false);
-
-const withCreds = parseGitUrl("https://tok:@gitlab.com/g/p.git");
-assert.equal(withCreds?.hasCredentials, true);
-
-assert.equal(
-	embedToken(https!, "SECRET", "oauth2"),
-	"https://oauth2:SECRET@github.com/hajekj14/pi-arcane.git",
-);
-assert.ok(!redactUrl("https://oauth2:SECRET@github.com/a/b.git").includes("SECRET"));
-assert.ok(sameRepo("git@github.com:a/b.git", "https://github.com/a/b"));
-assert.ok(!sameRepo("git@github.com:a/b.git", "https://github.com/a/c"));
+// --- naming ----------------------------------------------------------------
 assert.equal(sanitizeName("Feature/My_Branch"), "feature-my_branch");
 
-assert.equal(
-	buildKitContext(
-		{ authenticatedUrl: "https://github.com/a/b.git" } as any,
-		"main",
-		"test-fixtures/compose-app",
-	),
-	"https://github.com/a/b.git#main:test-fixtures/compose-app",
-);
-assert.equal(
-	buildKitContext({ authenticatedUrl: "https://github.com/a/b.git" } as any, "main", "."),
-	"https://github.com/a/b.git#main",
-);
+// --- upload: slug ----------------------------------------------------------
+// Two checkouts of the same project must not share a context directory, or one
+// deploy would overwrite the other's build inputs.
+{
+	const a = contextSlug("/home/me/work/app", "app");
+	const b = contextSlug("/home/me/other/app", "app");
+	assert.notEqual(a, b, "different checkouts get different slugs");
+	assert.equal(a, contextSlug("/home/me/work/app", "app"), "the slug is stable");
+	assert.ok(a.startsWith("app-"), "the slug is recognisable");
+	assert.match(a, /^[a-z0-9._-]+$/, "the slug is safe as a path segment");
+}
 
-// --- remote branch state ---------------------------------------------------
-// A remote that cannot be reached must report "unknown", never "absent" —
-// otherwise an auth or network failure tells the user to push work that is
-// already pushed. Using this repo as its own remote keeps the test offline.
+assert.equal(formatBytes(512), "512 B");
+assert.equal(formatBytes(2 * 1024 * 1024), "2.0 MB");
+
+// --- upload: file selection -------------------------------------------------
+// Uses this repo, which has a .gitignore excluding node_modules and .pi/.
 {
 	const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+	const files = await collectFiles(repoRoot);
+	const paths = files.map((f) => f.path);
 
-	const present = await checkRemoteBranch(repoRoot, "main", repoRoot);
-	assert.equal(present.state, "present");
-	assert.equal(present.upToDate, true, "local main matches itself");
-	assert.ok(present.remoteCommit);
+	assert.ok(paths.includes("package.json"), "tracked files are collected");
+	assert.ok(paths.includes("extension/upload.ts"), "nested files keep POSIX paths");
+	assert.ok(
+		!paths.some((p) => p.startsWith("node_modules/")),
+		"gitignored directories are excluded",
+	);
+	assert.ok(!paths.some((p) => p.includes("\\")), "no backslashes leak into upload paths");
+	assert.ok(
+		files.every((f) => f.size >= 0 && f.absolutePath.length > 0),
+		"every file carries a size and an absolute path",
+	);
+}
 
-	const absent = await checkRemoteBranch(repoRoot, "no-such-branch-xyz", repoRoot);
-	assert.equal(absent.state, "absent", "a reachable remote without the branch is absent");
+// --- upload: compose build contexts ----------------------------------------
+// A compose build context is relative to the compose file and means nothing on
+// the Arcane host, so it must be repointed at the uploaded copy.
+{
+	const rewritten = rewriteBuildContexts(
+		"services:\n  web:\n    build: .\n  api:\n    build:\n      context: ./api\n      dockerfile: Dockerfile.api\n  db:\n    image: postgres\n",
+		"/app/data/pi-arcane/app-abc123/ctx",
+	);
+	assert.deepEqual(rewritten.rewritten, ["web", "api"], "only services with build: are touched");
 
-	const unreachable = await checkRemoteBranch(repoRoot, "main", "not-a-real-remote-xyz");
-	assert.equal(unreachable.state, "unknown", "an unreachable remote is unknown, not absent");
-	assert.ok(unreachable.error, "the failure reason is reported");
+	const doc = rewritten.content;
+	assert.ok(doc.includes("/app/data/pi-arcane/app-abc123/ctx"), "web points at the upload");
+	assert.ok(doc.includes("/app/data/pi-arcane/app-abc123/ctx/api"), "api keeps its subdirectory");
+	assert.ok(doc.includes("Dockerfile.api"), "other build keys survive the rewrite");
+	assert.ok(doc.includes("postgres"), "image-only services are untouched");
+
+	const absolute = rewriteBuildContexts(
+		"services:\n  web:\n    build:\n      context: /srv/thing\n",
+		"/app/data/pi-arcane/app-abc123/ctx",
+	);
+	assert.deepEqual(absolute.rewritten, [], "an absolute context is left alone");
+
+	const nested = rewriteBuildContexts(
+		"services:\n  web:\n    build: .\n",
+		"/app/data/pi-arcane/app-abc123/ctx",
+		"deploy",
+	);
+	assert.ok(
+		nested.content.includes("/app/data/pi-arcane/app-abc123/ctx/deploy"),
+		"a compose file in a subdirectory resolves against its own directory",
+	);
 }
 
 // --- config ----------------------------------------------------------------

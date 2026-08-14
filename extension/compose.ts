@@ -6,7 +6,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join, posix, relative, sep } from "node:path";
 import yaml from "js-yaml";
 import { DEFAULT_CONTAINER_PORT, DEFAULT_HOST_PORT, parsePortMapping } from "./config.ts";
-import type { SyncTargetType } from "./types.ts";
+import type { DeployShape } from "./types.ts";
 
 /** Compose filenames, in the order Docker Compose itself resolves them. */
 const COMPOSE_FILENAMES = [
@@ -17,7 +17,7 @@ const COMPOSE_FILENAMES = [
 ];
 
 export interface DetectedTarget {
-	targetType: SyncTargetType;
+	targetType: DeployShape;
 	/** Repo-root-relative, POSIX-separated path to the compose file, if any. */
 	composePath?: string;
 	/** Repo-root-relative, POSIX-separated path to the Dockerfile, if any. */
@@ -292,6 +292,67 @@ export function prepareCompose(
 		containerName,
 		notes,
 	};
+}
+
+export interface RewriteResult {
+	content: string;
+	/** Services whose build context was repointed. */
+	rewritten: string[];
+}
+
+/**
+ * Point every `build:` context at the uploaded copy of the tree.
+ *
+ * A compose file says `build: .` or `build: { context: ./api }`, both relative
+ * to the compose file's own directory — a path that exists on this machine and
+ * nowhere on the Arcane host. Since the tree has just been uploaded, those
+ * contexts are rebased onto the uploaded directory, preserving each service's
+ * subdirectory. Absolute contexts are left alone: they already name a path on
+ * the host, and second-guessing that would break a deliberate choice.
+ *
+ * `composeDir` is the compose file's directory relative to the upload root, so
+ * a compose file in a subdirectory still resolves its siblings correctly.
+ */
+export function rewriteBuildContexts(
+	content: string,
+	uploadedContextPath: string,
+	composeDir = ".",
+): RewriteResult {
+	const doc = parseCompose(content);
+	const services = (doc.services ?? {}) as Record<string, ComposeService | null>;
+	const rewritten: string[] = [];
+
+	for (const [name, raw] of Object.entries(services)) {
+		const service = (raw ?? {}) as ComposeService;
+		if (service.build === undefined) continue;
+
+		const original = typeof service.build === "string" ? service.build : undefined;
+		const asObject =
+			typeof service.build === "object" && service.build !== null
+				? (service.build as Record<string, unknown>)
+				: undefined;
+		const declared = original ?? (typeof asObject?.context === "string" ? asObject.context : ".");
+
+		// A URL or absolute path is already meaningful on the host; leave it.
+		if (/^[a-z][a-z0-9+.-]*:\/\//i.test(declared) || declared.startsWith("/")) continue;
+
+		const resolved = posix.normalize(
+			posix.join(uploadedContextPath, composeDir === "." ? "" : composeDir, declared),
+		);
+
+		if (original !== undefined) {
+			service.build = { context: resolved };
+		} else {
+			service.build = { ...asObject, context: resolved };
+		}
+		services[name] = service;
+		rewritten.push(name);
+	}
+
+	if (rewritten.length === 0) return { content, rewritten };
+
+	doc.services = services;
+	return { content: yaml.dump(doc, { lineWidth: 120, noRefs: true }), rewritten };
 }
 
 export interface GenerateComposeOptions {

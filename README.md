@@ -1,11 +1,25 @@
 # pi-arcane
 
 A [pi](https://github.com/earendil-works/pi-mono) extension for end-to-end **develop → deploy**
-workflows through [Arcane](https://arcane.hajek.click). Develop in pi, commit, push, then ask pi to
-deploy — the extension registers the repo with Arcane, drives a GitOps sync or an image build, and
-reports where the result is running.
+workflows through [Arcane](https://arcane.hajek.click). Develop in pi, then ask pi to deploy — the
+extension uploads the working tree to the Arcane host, builds it there, and reports where the result
+is running.
+
+**No git remote is involved.** Nothing is cloned, nothing has to be committed or pushed, and
+uncommitted or untracked files deploy exactly as they sit on disk. Only files that changed since the
+last deploy are re-uploaded.
 
 Built against Arcane API 2.6.0 (`https://arcane.hajek.click/api/openapi.json`) and pi 0.84.1.
+
+## Requirements
+
+Deploys push through an **upload sidecar** running next to Arcane: a ~6 MB
+`mayth/simple-upload-server` container that writes into a volume the Arcane container has mounted.
+Arcane builds from a directory on its own filesystem, and this is what puts the tree there.
+
+Deploy it once with [`upload-server/docker-compose.yml`](upload-server/docker-compose.yml), then
+point `upload.url` at it. See [plan-upload.md](plan-upload.md) §7 for the full rationale, the nginx
+body-size settings both proxy layers need, and how the shared-token auth is wired.
 
 ## Install
 
@@ -38,10 +52,11 @@ Run `/arcane-setup` inside pi, or write the config by hand. Resolution order (fi
 Minimal config:
 
 ```json
-{ "apiKey": "$ARCANE_API_KEY" }
+{
+  "apiKey": "$ARCANE_API_KEY",
+  "upload": { "url": "https://pump.hajek.click" }
+}
 ```
-
-If no config file exists anywhere, a bare `ARCANE_API_KEY` environment variable is enough.
 
 Full config:
 
@@ -49,14 +64,18 @@ Full config:
 {
   "host": "https://arcane.hajek.click",
   "apiKey": "$ARCANE_API_KEY",
-  "environmentId": "env_abc123",
+  "environmentId": "0",
+  "upload": {
+    "url": "https://pump.hajek.click",
+    "token": "$ARCANE_API_KEY",
+    "containerPath": "/app/data/pi-arcane",
+    "volumeName": "arcane_arcane-data",
+    "maxFileBytes": 268435456
+  },
   "defaults": {
-    "autoSync": false,
-    "syncInterval": 60,
     "composePath": "docker-compose.yml",
     "targetType": "compose",
     "projectName": "my-app",
-    "syncName": "my-app-staging",
     "portMapping": "5553:80"
   }
 }
@@ -66,55 +85,76 @@ Full config:
   escapes a leading `!`) — the same semantics as a pi provider key.
 - `environmentId` is optional. When absent, the extension calls `GET /environments`, auto-selects a
   lone environment or prompts, and writes the choice back so later sessions skip the prompt.
+- `upload.url` is **required for deploys**; everything else under `upload` has a working default:
+  - `token` defaults to the Arcane API key, because the sidecar is deployed with that same
+    credential. Accepts the same `$ENV_VAR` / `!command` forms.
+  - `containerPath` is where uploads appear *inside the Arcane container* — the path a build's
+    `contextDir` uses. Defaults to `/app/data/pi-arcane`.
+  - `volumeName` is only needed if the volume backing `containerPath` cannot be discovered from the
+    Arcane container's mounts. It is used to delete files that leave the working tree; the sidecar
+    has no DELETE.
+  - `maxFileBytes` must not exceed `-max_upload_size` in the sidecar or `client_max_body_size` in
+    either nginx layer. Defaults to 256 MiB.
 - Everything in `defaults` is optional; set a field only to force a value that should never be
   auto-detected.
 
 `arcane.json` is gitignored — it can hold a key.
 
-### Git credentials
+## What gets uploaded
 
-Arcane clones from the git remote, so it needs access. The extension looks for a token in
-`ARCANE_GIT_TOKEN`, `GIT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, `GITLAB_TOKEN`, `CI_JOB_TOKEN`, in that
-order, and prompts interactively as a fallback. A public repo needs none. SSH remotes are converted
-to HTTPS, since that is what Arcane clones with. Tokens are stored in Arcane's git-repository record,
-never written to disk by this extension, and redacted from all output.
+Inside a git repository: `git ls-files -co --exclude-standard`, i.e. every tracked file plus every
+untracked file that is not ignored, minus deletions. `.gitignore` is therefore honoured for free, and
+uncommitted work is included — that is the point. Outside a repository, the directory is walked with
+a built-in ignore list (`.git`, `node_modules`, `dist`, `.venv`, …).
+
+`.dockerignore` is applied on top, so anything the build would ignore is never sent.
+
+The upload root is the **working directory**, not the repository root, so a monorepo deploys one app
+at a time. Uploads land in `<containerPath>/<slug>/ctx`, where the slug combines the directory name
+with a hash of its absolute path — two checkouts of the same project never collide.
+
+Change detection is by SHA-256, recorded in a manifest stored beside the context (never inside it, so
+it cannot perturb BuildKit's cache key). The manifest is written **last**, so an interrupted upload
+re-uploads next time rather than silently under-uploading.
 
 ## Tools
 
 | Tool | What it does |
 | --- | --- |
-| `arcane_deploy` | Deploy the current repo. Detects compose vs. Dockerfile, registers the repo, creates/updates a GitOps sync or builds an image, deploys, and reports URLs. |
-| `arcane_status` | Projects, GitOps syncs and containers, with filters. |
-| `arcane_build` | Build an image on the Arcane host without deploying it. |
+| `arcane_deploy` | Upload the working tree and run it. Detects compose vs. Dockerfile, builds, deploys, and reports URLs. |
+| `arcane_status` | Projects and containers, with a filter. |
+| `arcane_build` | Upload and build an image on the Arcane host without deploying it. |
 | `arcane_logs` | Read container or project logs. |
-| `arcane_list` | List projects, syncs, containers, git repositories or environments. |
-| `arcane_destroy` | Tear down a project, its containers and its GitOps sync. Volumes kept unless asked. |
+| `arcane_list` | List projects, uploaded build contexts, containers or environments. |
+| `arcane_destroy` | Tear down a project, its containers and its uploaded build context. Volumes kept unless asked. |
 
 ## Commands
 
-- `/arcane-setup` — wizard: host, API key, environment, write config. `/arcane-setup test` also runs
-  a connection check.
-- `/arcane-status` — dashboard of environment status, projects, syncs and running containers,
-  rendered into the transcript.
+- `/arcane-setup` — wizard: host, API key, environment, upload sidecar, write config.
+  `/arcane-setup test` also runs a connection check.
+- `/arcane-status` — dashboard of environment status, projects, uploaded contexts and running
+  containers, rendered into the transcript.
 - `/arcane-destroy [project]` — pick a project and tear it down. Prompts before deleting volumes.
 
 ## How a deploy works
 
-**Compose repos** (a `compose.yaml` / `docker-compose.yml` exists):
+1. Collect the files (above) from the working directory.
+2. Diff them against the manifest of the previous upload; PUT what changed to the sidecar, 8 at a
+   time. Files that left the tree are deleted through Arcane's volume API.
+3. Then, depending on the shape:
 
-1. Read the git remote, branch and HEAD from the local checkout.
-2. Refuse to deploy if the branch is not on `origin`; warn if the working tree is dirty or local is
-   ahead of the remote. Arcane deploys the *pushed* commit.
-3. Register (or reuse) the repository in Arcane, refreshing credentials.
-4. Create or update a GitOps sync pointing at repo + branch + compose path.
-5. Trigger the sync — Arcane clones and applies the compose file.
-6. Patch Arcane's copy of the compose file if needed (see below), then bring the project up.
-7. Poll the resulting activity, then report project status, containers and URLs.
+**Compose projects** (a `compose.yaml` / `docker-compose.yml` exists): Arcane gets a copy of the
+compose file with every service's `build.context` rewritten to the uploaded path, so `up` builds from
+the uploaded tree. Absolute contexts and services without `build:` are left alone.
 
-**Dockerfile-only repos**: Arcane's project model is compose-based and a GitOps sync requires a
-compose file that exists in the repo, so instead the image is built from the git remote
-(`POST /images/build` with a BuildKit git context) and run as a generated one-service compose
-project. **Your repository is never modified.**
+**Dockerfile-only projects**: the image is built from the uploaded context
+(`POST /images/build` with `contextDir` pointing at it) and run as a generated one-service compose
+project.
+
+4. Poll the resulting activity, then report project status, containers and URLs.
+
+**Your local files are never modified**, and neither is the compose file in your repository — the
+rewrite applies only to the copy Arcane holds.
 
 ## Ports and public URLs
 
@@ -147,9 +187,8 @@ the host's other working vhosts already use.
 - Reports a URL only for ports that are genuinely published; it never prints a plausible-looking URL
   that would fail.
 
-The patch applies to Arcane's copy — **the file in git is untouched**. With `autoSync` off (the
-default) it is re-applied on every deploy. With `autoSync` on, Arcane's next poll overwrites it; the
-extension warns, and the fix is to commit the ports into the compose file.
+The patch applies to Arcane's copy — **your compose file is untouched** — and is re-applied on every
+deploy.
 
 Override with the `port_mapping` tool argument or `defaults.portMapping`. Ports outside 5550–5599 are
 rejected by the vhost's guard (which stops a crafted hostname reaching, say, Arcane's own port) —
@@ -179,33 +218,39 @@ runtime pi provides them.
 
 `test-fixtures/compose-app` and `test-fixtures/dockerfile-app` are two minimal nginx apps that serve
 a static page. The harness drives the real tools — the same code path the model uses — and then
-verifies over HTTP that the deployed page serves what is in git.
+verifies over HTTP that the deployed page serves what is on disk.
 
 Prerequisites:
 
 - `ARCANE_API_KEY` exported (or an `arcane.json` in one of the config locations).
-- The branch under test pushed to `origin` (Arcane clones from the remote, not your working tree).
-- `GITHUB_TOKEN` exported if this repository is private.
+- `upload.url` configured, and the sidecar running. Each fixture has its own
+  `.pi/arcane.json` (gitignored), which must carry it too, since the fixture directory is the cwd.
 - [`nginx/pi-arcane.conf`](nginx/pi-arcane.conf) installed on the Docker host, for the URL check.
-- The API key needs `git-repositories:create` and `:update` on top of the usual project, gitops,
-  images and container scopes.
+- No git remote, push, or repository scope is needed.
 
 ```bash
 export ARCANE_API_KEY=...
-git push origin main
 npm run e2e              # both fixtures
 npm run e2e -- compose   # just one
 ```
 
-The harness deploys each fixture, reads back the host port each one actually got, polls
-`https://pi-<port>.hajek.click` until the page contains the `<h1>` text from the committed
-`index.html`, then exercises `arcane_status` and `arcane_logs`. It exits non-zero if any check fails.
+Per fixture the harness:
 
-To test the full develop → deploy loop by hand:
+1. writes an **untracked** `www/uncommitted-marker.html` that exists nowhere in git,
+2. deploys, reads back the host port the project actually got, and polls
+   `https://pi-<port>.hajek.click` for the `<h1>` of `index.html`,
+3. polls the marker's URL — serving it is what proves the deploy came from the working tree rather
+   than a clone,
+4. deploys a second time and asserts the upload was incremental (0 files sent, all unchanged),
+5. exercises `arcane_status` and `arcane_logs`, and deletes the marker again.
+
+It exits non-zero if any check fails.
+
+To test the full develop → deploy loop by hand — note there is nothing to commit:
 
 ```bash
 cd test-fixtures/compose-app
 pi -e ../../extension
-> change "Works!" to "Works! v2" in www/index.html, commit and push, then deploy it to Arcane
+> change "Works!" to "Works! v2" in www/index.html, then deploy it to Arcane
 > curl the URL and check it says v2
 ```

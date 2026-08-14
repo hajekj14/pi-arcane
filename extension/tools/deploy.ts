@@ -1,15 +1,18 @@
 /**
- * `arcane_deploy` — the develop → deploy workflow (plan phase 3.1).
+ * `arcane_deploy` — upload the working tree and run it (plan-upload.md §3, §7).
  *
- * Two shapes are supported:
+ * The tree is pushed to the upload sidecar, which lands it in a directory the
+ * Arcane container can read. From there two shapes are supported:
  *
- * - **compose** — the repo has a compose file. A GitOps sync points Arcane at
- *   the repo/branch/compose path and `sync` makes Arcane pull and apply it.
+ * - **compose** — the project has a compose file. Arcane gets a copy of it with
+ *   every `build:` context rewritten to the uploaded path, so `up` builds from
+ *   the uploaded tree.
  *
- * - **container** — the repo only has a Dockerfile. Arcane's project model is
- *   compose-based and a GitOps sync needs a compose file that exists in the
- *   repo, so instead the image is built from the git remote and a generated
- *   one-service compose project runs it (plan 6.3). The repo is never modified.
+ * - **container** — only a Dockerfile. The image is built from the uploaded
+ *   context and a generated one-service compose project runs it.
+ *
+ * Nothing is cloned and nothing needs to be pushed; uncommitted work deploys
+ * exactly as it sits on disk. The local files are never modified.
  */
 
 import { basename, join } from "node:path";
@@ -23,63 +26,55 @@ import {
 	generateCompose,
 	prepareCompose,
 	readComposeFile,
-	readComposeInfo,
+	rewriteBuildContexts,
 	type PublishedPort,
 } from "../compose.ts";
-import { checkRemoteBranch, readGitContext, sanitizeName } from "../git.ts";
-import { buildKitContext, registerRepository, resolveRepo } from "../repo.ts";
-import { projectUiUrl, publicUrlsForContainer, requireRuntime } from "../runtime.ts";
+import { readGitContext, sanitizeName } from "../git.ts";
+import { projectUiUrl, publicUrlsForContainer, requireRuntime, requireUpload } from "../runtime.ts";
 import {
 	DEPLOYMENT_ENTRY_TYPE,
 	type ContainerSummary,
 	type DeploymentRecord,
-	type GitOpsSync,
+	type DeployShape,
 	type ProjectDetails,
-	type SyncTargetType,
 } from "../types.ts";
+import {
+	collectFiles,
+	contextSlug,
+	formatBytes,
+	syncContext,
+	type UploadResult,
+} from "../upload.ts";
 import { clampText, fields, toolError } from "./shared.ts";
 
 const parameters = Type.Object({
-	git_url: Type.Optional(
-		Type.String({
-			description:
-				"Repository URL Arcane should clone. Defaults to the local 'origin' remote, converted to HTTPS.",
-		}),
-	),
-	branch: Type.Optional(
-		Type.String({ description: "Branch to deploy. Defaults to the current branch." }),
-	),
 	compose_path: Type.Optional(
 		Type.String({
 			description:
-				"Compose file path relative to the repository root. Auto-detected when omitted.",
+				"Compose file path relative to the project root. Auto-detected when omitted.",
 		}),
 	),
 	project_name: Type.Optional(
 		Type.String({
 			description:
-				"Arcane project name. Defaults to the repository name, or the subdirectory name when the compose file is not at the repo root.",
+				"Arcane project name. Defaults to the project directory name, or the subdirectory name when deploying one.",
 		}),
-	),
-	sync_name: Type.Optional(
-		Type.String({ description: "GitOps sync name. Defaults to '<project>-<branch>'." }),
 	),
 	dockerfile: Type.Optional(
 		Type.String({
-			description:
-				"Dockerfile path relative to the repository root, for repos without a compose file.",
+			description: "Dockerfile path relative to the project root, for projects with no compose file.",
 		}),
 	),
 	target_type: Type.Optional(
 		StringEnum(["compose", "container"] as const, {
 			description:
-				"Force the deployment shape instead of detecting it. 'compose' uses a GitOps sync; 'container' builds the Dockerfile and runs a generated one-service project.",
+				"Force the deployment shape instead of detecting it. 'compose' deploys the compose file, building any service that declares build:; 'container' builds the Dockerfile and runs a generated one-service project.",
 		}),
 	),
 	subdir: Type.Optional(
 		Type.String({
 			description:
-				"Subdirectory of the repository to deploy, when the app is not at the repo root.",
+				"Subdirectory to deploy, when the app is not at the project root. Only this subtree is uploaded.",
 		}),
 	),
 	port_mapping: Type.Optional(
@@ -95,14 +90,10 @@ const parameters = Type.Object({
 			description: "Environment variables for the generated service (container deploys only).",
 		}),
 	),
-	auto_sync: Type.Optional(
+	refresh: Type.Optional(
 		Type.Boolean({
-			description:
-				"Let Arcane poll the branch and redeploy on its own. Default false (manual, CI-style deploys).",
+			description: "Re-upload every file instead of only what changed since the last upload.",
 		}),
-	),
-	sync_interval: Type.Optional(
-		Type.Integer({ minimum: 10, description: "Seconds between polls when auto_sync is on." }),
 	),
 	force_recreate: Type.Optional(
 		Type.Boolean({ description: "Recreate containers even when nothing changed." }),
@@ -116,25 +107,24 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 		name: "arcane_deploy",
 		label: "Arcane Deploy",
 		description: [
-			"Deploy the current repository to Arcane and report where it is running.",
+			"Deploy the current working tree to Arcane and report where it is running.",
 			"",
-			"Arcane clones from the git remote, so the branch must be pushed first — the tool",
-			"checks and refuses to deploy stale or unpushed work rather than silently",
-			"deploying something older than the working tree.",
+			"The tree is uploaded straight to the Arcane host — no git remote, no commit and no",
+			"push are involved, so uncommitted and untracked files deploy exactly as they are on",
+			"disk. Only files that changed since the last deploy are re-uploaded.",
 			"",
 			"Detects the deployment shape automatically:",
-			"  compose   - a compose file exists: registers the repo, creates/updates a GitOps",
-			"              sync, and syncs it so Arcane pulls and applies the compose file.",
-			"  container - only a Dockerfile exists: builds the image from the git remote and",
-			"              runs it as a generated one-service project. The repo is not modified.",
+			"  compose   - a compose file exists: Arcane runs it, building any service that",
+			"              declares build: from the uploaded tree.",
+			"  container - only a Dockerfile exists: builds the image and runs it as a generated",
+			"              one-service project.",
 			"",
 			"Returns the project status, containers, and the public URL of each running container.",
 		].join("\n"),
-		promptSnippet:
-			"Deploy the current repo to Arcane (GitOps sync for compose repos, image build for Dockerfile-only repos)",
+		promptSnippet: "Upload the current working tree to Arcane and deploy it",
 		promptGuidelines: [
 			"Use arcane_deploy when the user asks to deploy, ship, or publish the current project to Arcane.",
-			"Commit and push before calling arcane_deploy — Arcane deploys from the git remote, not the working tree.",
+			"No commit or push is needed first — the tool uploads the working tree as it is.",
 		],
 		parameters,
 
@@ -147,102 +137,77 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 
 			try {
 				const { client, environmentId, config } = await requireRuntime(ctx);
+				const upload = await requireUpload(ctx);
 				const defaults = config.defaults;
-
-				// --- 1/2. Repository and branch -------------------------------------
-				const git = await readGitContext(ctx.cwd, signal);
-				if (!git) {
-					throw new Error(
-						`${ctx.cwd} is not inside a git repository. Arcane deploys from a git remote, so the project must be a repo with a pushed branch.`,
-					);
-				}
-
-				const branch = params.branch ?? git.branch;
-				if (!branch) {
-					throw new Error(
-						"Could not determine the current branch (detached HEAD?). Pass branch explicitly.",
-					);
-				}
-
 				const warnings: string[] = [];
-				if (git.dirty) {
-					warnings.push(
-						"The working tree has uncommitted changes; Arcane deploys the pushed commit, not your local edits.",
-					);
-				}
-				const remoteBranch = await checkRemoteBranch(git.repoRoot, branch, "origin", signal);
-				if (remoteBranch.state === "absent") {
-					throw new Error(
-						`Branch "${branch}" does not exist on origin. Push it first — Arcane clones the branch from the remote.`,
-					);
-				}
-				if (remoteBranch.state === "unknown") {
-					// Could not reach the remote (no SSH agent, no token, offline).
-					// Deploying anyway is right: Arcane clones with its own
-					// credentials, which are unrelated to this machine's.
-					warnings.push(
-						`Could not verify origin/${branch} from here (${remoteBranch.error?.split("\n")[0] ?? "unknown error"}). Proceeding — Arcane clones with its own credentials. If the branch is unpushed, Arcane will deploy an older commit.`,
-					);
-				} else if (remoteBranch.upToDate === false) {
-					warnings.push(
-						`Local "${branch}" (${remoteBranch.localCommit?.slice(0, 8)}) differs from origin/${branch} (${remoteBranch.remoteCommit?.slice(0, 8)}); Arcane deploys the commit on the remote.`,
+
+				// --- 1. What are we deploying, and from where? -----------------------
+				// The upload root is the working directory, not the repository root: a
+				// repo can hold several apps, and uploading the whole tree to deploy one
+				// of them would be both wrong and slow.
+				const git = await readGitContext(ctx.cwd, signal);
+				const uploadRoot = params.subdir ? join(ctx.cwd, params.subdir) : ctx.cwd;
+
+				const branch = git?.branch;
+				step(`Source: ${uploadRoot}${branch ? ` (branch ${branch})` : ""}`);
+				if (git?.dirty.dirty) {
+					step(
+						`Working tree is dirty (${git.dirty.modified} modified, ${git.dirty.untracked} untracked) — files are uploaded as they are on disk.`,
 					);
 				}
 
-				step(`Repository: ${git.repoRoot}`);
-				step(`Branch: ${branch}${git.commit ? ` @ ${git.commit.slice(0, 8)}` : ""}`);
-
-				// --- 3. What are we deploying? --------------------------------------
-				const searchDir = params.subdir ? join(git.repoRoot, params.subdir) : ctx.cwd;
-				const detected = await detectTarget(git.repoRoot, searchDir);
-
-				const composePath =
-					params.compose_path ?? defaults.composePath ?? detected?.composePath;
+				const detected = await detectTarget(uploadRoot, uploadRoot);
+				const composePath = params.compose_path ?? defaults.composePath ?? detected?.composePath;
 				const dockerfilePath = params.dockerfile ?? detected?.dockerfilePath;
-				const targetType: SyncTargetType =
+				const targetType: DeployShape =
 					params.target_type ??
 					defaults.targetType ??
-					(composePath ? "compose" : dockerfilePath ? "container" : ("compose" as const));
+					(composePath ? "compose" : dockerfilePath ? "container" : "compose");
 
 				if (targetType === "compose" && !composePath) {
 					throw new Error(
-						`No compose file found in ${searchDir}. Add one, pass compose_path, or use target_type "container" with a Dockerfile.`,
+						`No compose file found in ${uploadRoot}. Add one, pass compose_path, or use target_type "container" with a Dockerfile.`,
 					);
 				}
 				if (targetType === "container" && !dockerfilePath) {
 					throw new Error(
-						`No Dockerfile found in ${searchDir}. Add one or pass dockerfile explicitly.`,
+						`No Dockerfile found in ${uploadRoot}. Add one or pass dockerfile explicitly.`,
 					);
 				}
 
-				const contextDir = detected?.contextDir ?? params.subdir ?? ".";
-				const repoBaseName = sanitizeName(
-					(git.parsedRemote?.path.split("/").filter(Boolean).pop() ??
-						basename(git.repoRoot)) as string,
-				);
-				// A repo can hold several apps; name the project after the subdirectory
-				// when the app is not at the root, so deployments do not collide.
 				const projectName = sanitizeName(
-					params.project_name ??
-						defaults.projectName ??
-						(contextDir === "." ? repoBaseName : basename(contextDir)),
+					params.project_name ?? defaults.projectName ?? basename(uploadRoot),
 				);
-				const syncName =
-					params.sync_name ?? defaults.syncName ?? `${projectName}-${sanitizeName(branch)}`;
-
 				step(
 					`Target: ${targetType}${composePath ? ` (${composePath})` : dockerfilePath ? ` (${dockerfilePath})` : ""} → project "${projectName}"`,
 				);
 
-				// --- 4. Register the repository in Arcane ---------------------------
-				const resolved = await resolveRepo(ctx, git, params.git_url);
-				const registration = await registerRepository(client, resolved, repoBaseName, signal);
-				step(
-					`Repository in Arcane: ${registration.repository.name} (${registration.repository.id}) — ${
-						registration.created ? "created" : registration.updated ? "credentials updated" : "reused"
-					}`,
-				);
-				if (resolved.tokenSource) step(`Auth: token from ${resolved.tokenSource}`);
+				// --- 2. Upload the tree ----------------------------------------------
+				const files = await collectFiles(uploadRoot, { signal });
+				if (files.length === 0) {
+					throw new Error(`Nothing to upload from ${uploadRoot} — the directory is empty.`);
+				}
+
+				const slug = contextSlug(uploadRoot, projectName);
+				step(`Uploading ${files.length} files...`);
+				const uploaded = await syncContext({
+					client,
+					environmentId,
+					config: upload,
+					root: uploadRoot,
+					slug,
+					files,
+					refresh: params.refresh,
+					signal,
+					onProgress: (done, total) => {
+						progress[progress.length - 1] = `Uploading ${done}/${total} files...`;
+						onUpdate?.({ content: [{ type: "text", text: progress.join("\n") }], details: {} });
+					},
+				});
+				progress[progress.length - 1] =
+					`Uploaded ${uploaded.uploaded} files (${formatBytes(uploaded.bytes)}), ${uploaded.unchanged} unchanged, ${uploaded.deleted} removed, in ${(uploaded.durationMs / 1000).toFixed(1)}s`;
+				step(`Context: ${uploaded.contextPath}`);
+				warnings.push(...uploaded.warnings);
 
 				const record: DeploymentRecord = {
 					timestamp: new Date().toISOString(),
@@ -251,49 +216,48 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 					branch,
 					composePath,
 					targetType,
-					repositoryId: registration.repository.id,
+					contextPath: uploaded.contextPath,
+					upload: {
+						uploaded: uploaded.uploaded,
+						deleted: uploaded.deleted,
+						unchanged: uploaded.unchanged,
+						bytes: uploaded.bytes,
+					},
 					status: "failed",
 				};
 
+				// --- 3. Turn it into a running project --------------------------------
 				let project: ProjectDetails | undefined;
 				let portNote: string | undefined;
 				let expectedPort: PublishedPort | undefined;
 
 				if (targetType === "compose") {
-					const result = await deployViaGitOps({
+					const result = await deployCompose({
 						client,
-						ctx,
 						signal,
 						step,
 						environmentId,
-						repositoryId: registration.repository.id,
-						syncName,
 						projectName,
-						branch,
+						uploadRoot,
 						composePath: composePath!,
-						repoRoot: git.repoRoot,
+						uploaded,
 						portMapping: params.port_mapping ?? defaults.portMapping,
-						autoSync: params.auto_sync ?? defaults.autoSync ?? false,
-						syncInterval: params.sync_interval ?? defaults.syncInterval,
 						forceRecreate: params.force_recreate,
 					});
 					project = result.project;
 					portNote = result.portNote;
 					expectedPort = result.expectedPort;
-					record.syncId = result.sync.id;
-					record.syncName = result.sync.name;
 					warnings.push(...result.warnings);
 				} else {
-					const result = await deployViaImageBuild({
+					const result = await deployImage({
 						client,
 						signal,
 						step,
 						environmentId,
 						projectName,
 						branch,
-						contextDir,
 						dockerfilePath: dockerfilePath!,
-						resolved,
+						uploaded,
 						portMapping: params.port_mapping ?? defaults.portMapping,
 						buildArgs: params.build_args,
 						envVars: params.env_vars,
@@ -305,7 +269,7 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 
 				record.projectId = project?.id;
 
-				// --- 8. Report ------------------------------------------------------
+				// --- 4. Report ---------------------------------------------------------
 				const containers = await client.listContainers(environmentId, signal);
 				const projectContainers = containersForProject(containers, projectName);
 
@@ -340,7 +304,11 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 						["status", project?.status],
 						["services", project ? `${project.runningCount}/${project.serviceCount}` : undefined],
 						["branch", branch],
-						["commit", project?.lastSyncCommit?.slice(0, 8)],
+						["context", uploaded.contextPath],
+						[
+							"upload",
+							`${uploaded.uploaded} sent (${formatBytes(uploaded.bytes)}), ${uploaded.unchanged} unchanged, ${uploaded.deleted} removed`,
+						],
 					]),
 				);
 				if (project?.statusReason) lines.push(`reason: ${project.statusReason}`);
@@ -395,7 +363,7 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 
 				return {
 					content: [{ type: "text", text }],
-					details: { record, project, endpoints },
+					details: { record, project, endpoints, upload: uploaded },
 				};
 			} catch (error) {
 				throw toolError(error);
@@ -405,29 +373,23 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 }
 
 // ---------------------------------------------------------------------------
-// compose → GitOps sync
+// compose → project built from the uploaded context
 // ---------------------------------------------------------------------------
 
-interface GitOpsArgs {
+interface ComposeArgs {
 	client: Awaited<ReturnType<typeof requireRuntime>>["client"];
-	ctx: Parameters<ToolDefinition["execute"]>[4];
 	signal: AbortSignal | undefined;
 	step: (message: string) => void;
 	environmentId: string;
-	repositoryId: string;
-	syncName: string;
 	projectName: string;
-	branch: string;
+	uploadRoot: string;
 	composePath: string;
-	repoRoot: string;
+	uploaded: UploadResult;
 	portMapping?: string;
-	autoSync: boolean;
-	syncInterval?: number;
 	forceRecreate?: boolean;
 }
 
-async function deployViaGitOps(args: GitOpsArgs): Promise<{
-	sync: GitOpsSync;
+async function deployCompose(args: ComposeArgs): Promise<{
 	project?: ProjectDetails;
 	portNote?: string;
 	expectedPort?: PublishedPort;
@@ -438,190 +400,97 @@ async function deployViaGitOps(args: GitOpsArgs): Promise<{
 		signal,
 		step,
 		environmentId,
-		repositoryId,
-		syncName,
 		projectName,
-		branch,
+		uploadRoot,
 		composePath,
-		repoRoot,
+		uploaded,
 		portMapping,
-		autoSync,
-		syncInterval,
 		forceRecreate,
 	} = args;
 
 	const warnings: string[] = [];
-
-	// Inspect the local copy of the compose file so the report can say what will
-	// actually be published, before Arcane has pulled anything.
-	const localCompose = await readComposeFile(join(repoRoot, composePath));
-	let expectedPort: PublishedPort | undefined;
-	let portNote: string | undefined;
-	let patchedCompose: string | undefined;
-	// A compose file with a `build:` directive needs its build context — the
-	// Dockerfile and everything it COPYs. Syncing the compose file alone leaves
-	// Arcane with nothing to build from.
-	let needsBuildContext = false;
-
-	if (localCompose) {
-		needsBuildContext = readComposeInfo(localCompose).services.some((s) => s.hasBuild);
-
-		// Only relevant when the compose file publishes nothing and we supply the
-		// mapping; an explicit port in git is the repo's decision to keep.
-		const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
-		const allocated = await allocateHostPort(
-			client,
-			environmentId,
-			projectName,
-			wanted.host,
-			signal,
-		);
-		if (allocated.moved) {
-			step(`Host port ${wanted.host} is taken; using ${allocated.port} instead.`);
-		}
-
-		const patch = prepareCompose(localCompose, {
-			portMapping: `${allocated.port}:${wanted.container}`,
-		});
-		expectedPort = patch.effectivePort;
-		portNote = patch.notes.join("; ");
-		if (patch.changed) {
-			patchedCompose = patch.content;
-			if (autoSync) {
-				warnings.push(
-					"auto_sync is on, so the next automatic sync will overwrite these in-Arcane compose edits. Put the ports and container_name in the committed compose file to make them stick.",
-				);
-			}
-		}
-	} else {
-		warnings.push(
-			`Could not read ${composePath} locally, so ports and container naming were left entirely to the committed file.`,
-		);
+	const local = await readComposeFile(join(uploadRoot, composePath));
+	if (!local) {
+		throw new Error(`Could not read ${composePath} under ${uploadRoot}.`);
 	}
 
-	// --- 5. Create or update the sync ---------------------------------------
-	const existingSyncs = await client.listGitOpsSyncs(environmentId, signal);
-	const existing =
-		existingSyncs.find((sync) => sync.name === syncName) ??
-		existingSyncs.find(
-			(sync) =>
-				sync.repositoryId === repositoryId &&
-				sync.branch === branch &&
-				sync.composePath === composePath,
-		);
-
-	let sync: GitOpsSync;
-	if (existing) {
-		sync = await client.updateGitOpsSync(
-			environmentId,
-			existing.id,
-			{
-				name: syncName,
-				repositoryId,
-				branch,
-				composePath,
-				projectName,
-				targetType: "compose",
-				autoSync,
-				syncInterval: syncInterval ?? existing.syncInterval,
-				syncDirectory: needsBuildContext || existing.syncDirectory,
-			},
-			signal,
-		);
-		step(`GitOps sync updated: ${sync.name} (${sync.id})`);
-	} else {
-		sync = await client.createGitOpsSync(
-			environmentId,
-			{
-				name: syncName,
-				repositoryId,
-				branch,
-				composePath,
-				projectName,
-				targetType: "compose",
-				autoSync,
-				syncInterval: syncInterval ?? 60,
-				syncDirectory: needsBuildContext,
-			},
-			signal,
-		);
+	// Relative build contexts resolve against the compose file's directory, which
+	// does not exist on the Arcane host — rewrite them onto the uploaded copy.
+	const composeDir = composePath.includes("/")
+		? composePath.slice(0, composePath.lastIndexOf("/"))
+		: ".";
+	const rewritten = rewriteBuildContexts(local, uploaded.contextPath, composeDir);
+	if (rewritten.rewritten.length > 0) {
 		step(
-			`GitOps sync created: ${sync.name} (${sync.id})${needsBuildContext ? " — syncing the whole directory for the build context" : ""}`,
+			`Build context for ${rewritten.rewritten.join(", ")} → ${uploaded.contextPath}`,
 		);
 	}
 
-	// --- 6. Trigger the sync -------------------------------------------------
-	step("Syncing from git (Arcane clones the repo and applies the compose file)...");
-	const result = await client.syncNow(environmentId, sync.id, signal);
-	if (!result.success) {
-		throw new Error(
-			`GitOps sync failed: ${result.error ?? result.message ?? "no detail returned"}`,
+	// Only fill in a published port when the compose file publishes none; a repo
+	// that declares its own ports is being deliberate.
+	const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
+	const allocated = await allocateHostPort(client, environmentId, projectName, wanted.host, signal);
+	if (allocated.moved) {
+		step(`Host port ${wanted.host} is taken; using ${allocated.port} instead.`);
+	}
+	const patch = prepareCompose(rewritten.content, {
+		portMapping: `${allocated.port}:${wanted.container}`,
+	});
+	const composeContent = patch.changed ? patch.content : rewritten.content;
+
+	const projects = await client.listProjects(environmentId, signal);
+	const existing = projects.find((p) => p.name === projectName);
+
+	let project: ProjectDetails;
+	if (existing) {
+		project = await client.updateProject(environmentId, existing.id, { composeContent }, signal);
+		step(`Project updated: ${project.name} (${project.id})`);
+	} else {
+		const created = await client.createProject(
+			environmentId,
+			{ name: projectName, composeContent },
+			signal,
 		);
-	}
-	step(`Sync: ${result.message}`);
-
-	// Re-read to pick up projectId and the applied commit.
-	sync = await client.getGitOpsSync(environmentId, sync.id, signal);
-	if (sync.lastSyncError) warnings.push(`Last sync reported: ${sync.lastSyncError}`);
-
-	let project = await findProject(client, environmentId, sync.projectId, projectName, signal);
-	if (!project) {
-		throw new Error(
-			`The sync succeeded but no project named "${projectName}" appeared in Arcane. Check the sync's compose path (${composePath}).`,
-		);
+		step(`Project created: ${created.name} (${created.id})`);
+		project = await client.getProject(environmentId, created.id, signal);
 	}
 
-	// --- 7. Apply the port patch, if the repo compose published nothing ------
-	if (patchedCompose) {
-		try {
-			project = await client.updateProject(
-				environmentId,
-				project.id,
-				{ composeContent: patchedCompose },
-				signal,
-			);
-			step(`Patched Arcane's compose copy: ${portNote}`);
-		} catch (error) {
-			warnings.push(`Could not patch the compose file in Arcane: ${(error as Error).message}`);
-		}
-	}
-
-	// --- 7b. Make sure it is actually up ------------------------------------
-	step("Deploying project...");
+	step("Deploying project (compose builds from the uploaded context)...");
 	const output = await client.deployProject(
 		environmentId,
 		project.id,
-		{ forceRecreate: forceRecreate ?? false },
+		// The context path is stable across deploys, so without forceRecreate
+		// compose would keep a container built from an older upload.
+		{ forceRecreate: forceRecreate ?? true },
 		signal,
 	);
 	if (output.trim()) step(clampText(output.trim(), 2000));
 
 	project = await waitForProjectSettled(client, environmentId, project.id, signal, step);
 
-	return { sync, project, portNote, expectedPort, warnings };
+	return { project, portNote: patch.notes.join("; "), expectedPort: patch.effectivePort, warnings };
 }
 
 // ---------------------------------------------------------------------------
 // Dockerfile → image build → generated project
 // ---------------------------------------------------------------------------
 
-interface ImageBuildArgs {
+interface ImageArgs {
 	client: Awaited<ReturnType<typeof requireRuntime>>["client"];
 	signal: AbortSignal | undefined;
 	step: (message: string) => void;
 	environmentId: string;
 	projectName: string;
-	branch: string;
-	contextDir: string;
+	branch?: string;
 	dockerfilePath: string;
-	resolved: Awaited<ReturnType<typeof resolveRepo>>;
+	uploaded: UploadResult;
 	portMapping?: string;
 	buildArgs?: Record<string, string>;
 	envVars?: Record<string, string>;
 	forceRecreate?: boolean;
 }
 
-async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
+async function deployImage(args: ImageArgs): Promise<{
 	project?: ProjectDetails;
 	expectedPort?: PublishedPort;
 }> {
@@ -632,26 +501,22 @@ async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 		environmentId,
 		projectName,
 		branch,
-		contextDir,
 		dockerfilePath,
-		resolved,
+		uploaded,
 		portMapping,
 		buildArgs,
 		envVars,
 		forceRecreate,
 	} = args;
 
-	const tag = `${projectName}:${sanitizeName(branch)}`;
-	const contextRef = buildKitContext(resolved, branch, contextDir);
-	const dockerfileInContext =
-		contextDir === "." ? dockerfilePath : dockerfilePath.replace(`${contextDir}/`, "");
+	const tag = `${projectName}:${sanitizeName(branch ?? "latest")}`;
 
-	step(`Building ${tag} from ${resolved.displayUrl}#${branch}...`);
+	step(`Building ${tag} from ${uploaded.contextPath}...`);
 	const output = await client.buildImage(
 		environmentId,
 		{
-			contextDir: contextRef,
-			dockerfile: dockerfileInContext,
+			contextDir: uploaded.contextPath,
+			dockerfile: dockerfilePath,
 			tags: [tag],
 			buildArgs,
 			load: true,
@@ -659,20 +524,13 @@ async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 		},
 		signal,
 	);
-	if (/^ERROR|error:/im.test(output)) {
+	if (/^ERROR|error:|"error"/im.test(output)) {
 		throw new Error(`Image build failed:\n${clampText(output.trim(), 8000)}`);
 	}
 	step(`Built ${tag}.`);
 
-	// The generated compose runs the freshly built image; the repo is untouched.
 	const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
-	const allocated = await allocateHostPort(
-		client,
-		environmentId,
-		projectName,
-		wanted.host,
-		signal,
-	);
+	const allocated = await allocateHostPort(client, environmentId, projectName, wanted.host, signal);
 	if (allocated.moved) {
 		step(`Host port ${wanted.host} is taken; using ${allocated.port} instead.`);
 	}
@@ -723,24 +581,6 @@ async function deployViaImageBuild(args: ImageBuildArgs): Promise<{
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-async function findProject(
-	client: ImageBuildArgs["client"],
-	environmentId: string,
-	projectId: string | undefined,
-	projectName: string,
-	signal: AbortSignal | undefined,
-): Promise<ProjectDetails | undefined> {
-	if (projectId) {
-		try {
-			return await client.getProject(environmentId, projectId, signal);
-		} catch {
-			// Fall through to a name lookup — the recorded ID may be stale.
-		}
-	}
-	const projects = await client.listProjects(environmentId, signal);
-	return projects.find((p) => p.id === projectId) ?? projects.find((p) => p.name === projectName);
-}
-
 /**
  * Wait until the project stops reporting an in-flight activity.
  *
@@ -749,7 +589,7 @@ async function findProject(
  * final status and surfaces the failure message when there is one.
  */
 async function waitForProjectSettled(
-	client: ImageBuildArgs["client"],
+	client: ImageArgs["client"],
 	environmentId: string,
 	projectId: string,
 	signal: AbortSignal | undefined,
@@ -785,7 +625,7 @@ async function waitForProjectSettled(
  * instead of drifting upward on every run.
  */
 async function allocateHostPort(
-	client: ImageBuildArgs["client"],
+	client: ImageArgs["client"],
 	environmentId: string,
 	projectName: string,
 	preferred: string,

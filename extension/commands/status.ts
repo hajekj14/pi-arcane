@@ -6,7 +6,8 @@
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { publicUrlsForContainer, requireRuntime } from "../runtime.ts";
+import { optionalUpload, publicUrlsForContainer, requireRuntime } from "../runtime.ts";
+import { listContexts } from "../upload.ts";
 
 export const STATUS_ENTRY_TYPE = "arcane-status";
 
@@ -20,15 +21,9 @@ export interface StatusEntryData {
 		status: string;
 		running: number;
 		total: number;
-		gitOps?: string;
 	}>;
-	syncs: Array<{
-		name: string;
-		branch: string;
-		lastStatus: string;
-		lastAt?: string;
-		error?: string;
-	}>;
+	/** Build contexts uploaded to the Arcane host, by slug. */
+	contexts: string[];
 	containers: Array<{ name: string; state: string; ports: string; url?: string }>;
 	error?: string;
 }
@@ -38,12 +33,15 @@ export async function runStatus(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	try {
 		const { client, environmentId, environmentName, config } = await requireRuntime(ctx);
 
-		const [projects, syncs, containers, environment] = await Promise.all([
+		const upload = await optionalUpload(ctx);
+		const [projects, containers, environment, contexts] = await Promise.all([
 			client.listProjects(environmentId),
-			client.listGitOpsSyncs(environmentId),
 			client.listContainers(environmentId),
 			// Non-fatal: the dashboard still renders without the environment row.
 			client.getEnvironment(environmentId).catch(() => undefined),
+			upload
+				? listContexts(client, environmentId, upload).catch(() => [] as string[])
+				: Promise.resolve([] as string[]),
 		]);
 
 		const data: StatusEntryData = {
@@ -56,15 +54,8 @@ export async function runStatus(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 				status: project.status,
 				running: project.runningCount,
 				total: project.serviceCount,
-				gitOps: project.gitOpsManagedBy,
 			})),
-			syncs: syncs.map((sync) => ({
-				name: sync.name,
-				branch: sync.branch,
-				lastStatus: sync.lastSyncStatus ?? "never",
-				lastAt: sync.lastSyncAt,
-				error: sync.lastSyncError,
-			})),
+			contexts,
 			containers: containers.map((container) => {
 				const name =
 					(container.names ?? [])[0]?.replace(/^\//, "") ?? container.id.slice(0, 12);
@@ -94,7 +85,7 @@ export async function runStatus(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 			host: "",
 			environmentId: "",
 			projects: [],
-			syncs: [],
+			contexts: [],
 			containers: [],
 			error: message,
 		} satisfies StatusEntryData);

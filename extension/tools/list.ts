@@ -6,11 +6,12 @@
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { publicUrlsForContainer, requireRuntime } from "../runtime.ts";
+import { optionalUpload, publicUrlsForContainer, requireRuntime } from "../runtime.ts";
+import { listContexts } from "../upload.ts";
 import { toolError } from "./shared.ts";
 
 const parameters = Type.Object({
-	resource: StringEnum(["projects", "syncs", "containers", "repositories", "environments"] as const, {
+	resource: StringEnum(["projects", "contexts", "containers", "environments"] as const, {
 		description: "Which kind of Arcane resource to list.",
 	}),
 });
@@ -26,12 +27,11 @@ export function createListTool(): ToolDefinition<typeof parameters> {
 			"",
 			"resource:",
 			"  projects      - compose projects, with status and service counts",
-			"  syncs         - GitOps syncs, with branch, compose path and last sync result",
+			"  contexts      - build contexts uploaded to the Arcane host, including orphans",
 			"  containers    - running/stopped containers, with published ports and public URLs",
-			"  repositories  - git repositories registered in Arcane (global, not per-environment)",
 			"  environments  - all Docker environments Arcane can reach",
 		].join("\n"),
-		promptSnippet: "List Arcane projects, GitOps syncs, containers, git repositories or environments",
+		promptSnippet: "List Arcane projects, uploaded build contexts, containers or environments",
 		parameters,
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
@@ -56,37 +56,35 @@ export function createListTool(): ToolDefinition<typeof parameters> {
 						};
 					}
 
-					case "repositories": {
-						const repos = await client.listRepositories(signal);
-						const lines = repos.map(
-							(repo) =>
-								`${repo.id}  ${repo.name}  ${repo.url}  auth=${repo.authType}  enabled=${repo.enabled}`,
-						);
-						return {
-							content: [{ type: "text", text: header(`${repos.length} git repository(ies)`, lines) }],
-							details: { resource: params.resource, repositories: repos },
-						};
-					}
+					case "contexts": {
+						const upload = await optionalUpload(ctx);
+						if (!upload) {
+							return {
+								content: [
+									{
+										type: "text",
+										text: "No upload sidecar is configured, so there are no uploaded build contexts. Set upload.url in arcane.json.",
+									},
+								],
+								details: { resource: params.resource, contexts: [] },
+							};
+						}
 
-					case "syncs": {
-						const syncs = await client.listGitOpsSyncs(environmentId, signal);
-						const lines = syncs.map((sync) =>
-							[
-								sync.id,
-								sync.name,
-								`project=${sync.projectName}`,
-								`branch=${sync.branch}`,
-								`compose=${sync.composePath}`,
-								`autoSync=${sync.autoSync}`,
-								`last=${sync.lastSyncStatus ?? "never"}${sync.lastSyncAt ? ` @ ${sync.lastSyncAt}` : ""}`,
-								sync.lastSyncError ? `error=${sync.lastSyncError}` : "",
-							]
-								.filter(Boolean)
-								.join("  "),
-						);
+						const slugs = await listContexts(client, environmentId, upload, signal);
+						const projects = await client.listProjects(environmentId, signal);
+						// A context whose project is gone is dead weight on the host; say so
+						// rather than leaving it to be discovered by a disk-full alert.
+						const lines = slugs.map((slug) => {
+							const owner = projects.find((p) => slug.startsWith(`${p.name}-`));
+							return `${slug}  ${upload.containerPath}/${slug}/ctx  ${
+								owner ? `project=${owner.name}` : "orphan (no matching project)"
+							}`;
+						});
 						return {
-							content: [{ type: "text", text: header(`${syncs.length} GitOps sync(s)`, lines) }],
-							details: { resource: params.resource, syncs },
+							content: [
+								{ type: "text", text: header(`${slugs.length} uploaded build context(s)`, lines) },
+							],
+							details: { resource: params.resource, contexts: slugs },
 						};
 					}
 

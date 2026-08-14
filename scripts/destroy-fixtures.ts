@@ -70,8 +70,8 @@ console.log("\n=== remaining projects ===");
 resetRuntime();
 console.log(await runTool(listTool, { resource: "projects" }, cwd));
 
-console.log("\n=== remaining GitOps syncs ===");
+console.log("\n=== remaining uploaded build contexts ===");
 resetRuntime();
-console.log(await runTool(listTool, { resource: "syncs" }, cwd));
+console.log(await runTool(listTool, { resource: "contexts" }, cwd));
 
 process.exit(failed === 0 ? 0 : 1);

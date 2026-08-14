@@ -1,5 +1,12 @@
 # Direct Repository Upload → Build — Implementation Plan
 
+> **Status: implemented and shipped.** Upload is now the *only* deploy path — the git-remote /
+> GitOps route was removed entirely (`extension/repo.ts` deleted, git-repository and GitOps-sync
+> clients dropped, `arcane_build` and `arcane_deploy` rewritten around `extension/upload.ts`). The
+> `source: "git" | "upload" | "auto"` switch described in §3.6 was therefore never built: there is
+> nothing to switch between. Verified end to end against both fixtures — 12/12 checks, including
+> serving an untracked file that exists nowhere in git.
+
 ## Verdict
 
 **Yes, it is possible today** — without any change to Arcane — but not through a purpose-built

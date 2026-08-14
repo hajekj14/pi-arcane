@@ -106,7 +106,26 @@ export async function runSetup(args: string, ctx: ExtensionCommandContext): Prom
 		environmentId = environments[labels.indexOf(picked)].id;
 	}
 
-	// --- 4. Where to write --------------------------------------------------
+	// --- 4. Upload sidecar ----------------------------------------------------
+	// Every deploy pushes the working tree through it, so a config without one
+	// cannot deploy at all.
+	const uploadAnswer = await ctx.ui.input(
+		"Upload sidecar URL (required for deploys):",
+		existing?.upload?.url ?? "",
+	);
+	if (uploadAnswer === undefined) {
+		ctx.ui.notify("Setup cancelled.", "info");
+		return;
+	}
+	const uploadUrl = uploadAnswer.trim() || existing?.upload?.url;
+	if (!uploadUrl) {
+		ctx.ui.notify(
+			"No upload sidecar set — arcane_deploy and arcane_build will refuse to run until upload.url is configured. Deploy one with upload-server/docker-compose.yml.",
+			"warning",
+		);
+	}
+
+	// --- 5. Where to write --------------------------------------------------
 	const candidates = configSearchPaths(ctx.cwd);
 	const projectLabel = `${candidates[0]}  (project-local, gitignored)`;
 	const globalLabel = `${candidates[2]}  (global, all projects)`;
@@ -126,13 +145,16 @@ export async function runSetup(args: string, ctx: ExtensionCommandContext): Prom
 			host,
 			...(apiKeyStored ? { apiKey: apiKeyStored } : {}),
 			environmentId,
+			// The token is left unset on purpose: it defaults to the Arcane API key,
+			// which the sidecar is deployed with.
+			...(uploadUrl ? { upload: { url: uploadUrl } } : {}),
 		});
 	} catch (error) {
 		ctx.ui.notify(`Could not write ${target}: ${(error as Error).message}`, "error");
 		return;
 	}
 
-	// --- 5. Re-prime the session with the new config ------------------------
+	// --- 6. Re-prime the session with the new config ------------------------
 	resetRuntime();
 	const reloaded = await safeLoad(ctx.cwd);
 	if (reloaded) primeRuntime(reloaded);

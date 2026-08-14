@@ -45,14 +45,14 @@ export default function arcaneExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("arcane-destroy", {
-		description: "Tear down a deployed Arcane project and its GitOps sync",
+		description: "Tear down a deployed Arcane project and its uploaded build context",
 		handler: async (args, ctx) => {
 			await runDestroy(args, ctx);
 		},
 	});
 
 	pi.registerCommand("arcane-status", {
-		description: "Show Arcane projects, GitOps syncs and running containers",
+		description: "Show Arcane projects, uploaded build contexts and running containers",
 		handler: async (_args, ctx) => {
 			await runStatus(pi, ctx);
 		},
@@ -153,14 +153,9 @@ export default function arcaneExtension(pi: ExtensionAPI): void {
 		}
 
 		if (expanded) {
-			box.addChild(new Text(theme.fg("muted", `Syncs (${data.syncs.length})`)));
-			for (const sync of data.syncs) {
-				box.addChild(
-					new Text(
-						`  ${sync.name} ${theme.fg("dim", `${sync.branch} ${sync.lastStatus}${sync.lastAt ? ` @ ${sync.lastAt}` : ""}`)}`,
-					),
-				);
-				if (sync.error) box.addChild(new Text(theme.fg("error", `    ${sync.error}`)));
+			box.addChild(new Text(theme.fg("muted", `Uploaded contexts (${data.contexts.length})`)));
+			for (const slug of data.contexts) {
+				box.addChild(new Text(theme.fg("dim", `  ${slug}`)));
 			}
 		}
 
