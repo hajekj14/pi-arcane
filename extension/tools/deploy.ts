@@ -15,20 +15,23 @@
  * exactly as it sits on disk. The local files are never modified.
  */
 
-import { basename, join } from "node:path";
+import { basename, join, posix } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
+import { ensureBaseImages, explainBuildFailure } from "../baseimages.ts";
 import { DEFAULT_CONTAINER_PORT, DEFAULT_HOST_PORT, parsePortMapping } from "../config.ts";
 import {
 	detectTarget,
 	generateCompose,
 	prepareCompose,
+	readBuildDirectives,
 	readComposeFile,
 	rewriteBuildContexts,
 	type PublishedPort,
 } from "../compose.ts";
+import { readBaseImages } from "./build.ts";
 import { readGitContext, sanitizeName } from "../git.ts";
 import { projectUiUrl, publicUrlsForContainer, requireRuntime, requireUpload } from "../runtime.ts";
 import {
@@ -256,6 +259,7 @@ export function createDeployTool(pi: ExtensionAPI): ToolDefinition<typeof parame
 						environmentId,
 						projectName,
 						branch,
+						uploadRoot,
 						dockerfilePath: dockerfilePath!,
 						uploaded,
 						portMapping: params.port_mapping ?? defaults.portMapping,
@@ -426,6 +430,18 @@ async function deployCompose(args: ComposeArgs): Promise<{
 		);
 	}
 
+	// Compose builds during `up`, on the same builder with the same limitation,
+	// so every service that builds needs its base images on the host first.
+	const pullReport = await ensureBaseImages(
+		client,
+		environmentId,
+		await composeBaseImages(local, uploadRoot, composeDir),
+		{ signal, onProgress: step },
+	);
+	for (const failure of pullReport.failed) {
+		warnings.push(`Could not pull ${failure.image}: ${failure.error}`);
+	}
+
 	// Only fill in a published port when the compose file publishes none; a repo
 	// that declares its own ports is being deliberate.
 	const wanted = parsePortMapping(portMapping ?? `${DEFAULT_HOST_PORT}:${DEFAULT_CONTAINER_PORT}`);
@@ -456,19 +472,55 @@ async function deployCompose(args: ComposeArgs): Promise<{
 	}
 
 	step("Deploying project (compose builds from the uploaded context)...");
-	const output = await client.deployProject(
-		environmentId,
-		project.id,
-		// The context path is stable across deploys, so without forceRecreate
-		// compose would keep a container built from an older upload.
-		{ forceRecreate: forceRecreate ?? true },
-		signal,
-	);
+	let output: string;
+	try {
+		output = await client.deployProject(
+			environmentId,
+			project.id,
+			// The context path is stable across deploys, so without forceRecreate
+			// compose would keep a container built from an older upload.
+			{ forceRecreate: forceRecreate ?? true },
+			signal,
+		);
+	} catch (error) {
+		const explanation = explainBuildFailure((error as Error).message, pullReport);
+		throw explanation ? new Error(`${(error as Error).message}\n\n${explanation}`) : error;
+	}
+	const explained = explainBuildFailure(output, pullReport);
+	if (explained) warnings.push(explained);
 	if (output.trim()) step(clampText(output.trim(), 2000));
 
 	project = await waitForProjectSettled(client, environmentId, project.id, signal, step);
 
 	return { project, portNote: patch.notes.join("; "), expectedPort: patch.effectivePort, warnings };
+}
+
+/**
+ * Base images of every service the compose file builds.
+ *
+ * Each service's Dockerfile is read from the local tree — the same bytes that
+ * were just uploaded — resolving its context relative to the compose file.
+ */
+async function composeBaseImages(
+	composeContent: string,
+	uploadRoot: string,
+	composeDir: string,
+): Promise<string[]> {
+	const images: string[] = [];
+
+	for (const directive of readBuildDirectives(composeContent)) {
+		// An absolute context lives on the Arcane host, not here; nothing to read.
+		if (directive.context.startsWith("/")) continue;
+		if (/^[a-z][a-z0-9+.-]*:\/\//i.test(directive.context)) continue;
+
+		const relative = posix.normalize(
+			posix.join(composeDir === "." ? "" : composeDir, directive.context),
+		);
+		const contextRoot = join(uploadRoot, relative);
+		images.push(...(await readBaseImages(contextRoot, directive.dockerfile, directive.args)));
+	}
+
+	return [...new Set(images)];
 }
 
 // ---------------------------------------------------------------------------
@@ -482,6 +534,8 @@ interface ImageArgs {
 	environmentId: string;
 	projectName: string;
 	branch?: string;
+	/** Local directory that was uploaded, for reading the Dockerfile back. */
+	uploadRoot: string;
 	dockerfilePath: string;
 	uploaded: UploadResult;
 	portMapping?: string;
@@ -501,6 +555,7 @@ async function deployImage(args: ImageArgs): Promise<{
 		environmentId,
 		projectName,
 		branch,
+		uploadRoot,
 		dockerfilePath,
 		uploaded,
 		portMapping,
@@ -510,6 +565,14 @@ async function deployImage(args: ImageArgs): Promise<{
 	} = args;
 
 	const tag = `${projectName}:${sanitizeName(branch ?? "latest")}`;
+
+	// Arcane's builder cannot fetch base images itself; see baseimages.ts.
+	const pullReport = await ensureBaseImages(
+		client,
+		environmentId,
+		await readBaseImages(uploadRoot, dockerfilePath, buildArgs),
+		{ signal, onProgress: step },
+	);
 
 	step(`Building ${tag} from ${uploaded.contextPath}...`);
 	const output = await client.buildImage(
@@ -525,7 +588,12 @@ async function deployImage(args: ImageArgs): Promise<{
 		signal,
 	);
 	if (/^ERROR|error:|"error"/im.test(output)) {
-		throw new Error(`Image build failed:\n${clampText(output.trim(), 8000)}`);
+		const explanation = explainBuildFailure(output, pullReport);
+		throw new Error(
+			[`Image build failed:`, explanation, clampText(output.trim(), 8000)]
+				.filter(Boolean)
+				.join("\n"),
+		);
 	}
 	step(`Built ${tag}.`);
 

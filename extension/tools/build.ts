@@ -6,9 +6,11 @@
  * committed or pushed: what is on disk is what gets built.
  */
 
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { ensureBaseImages, explainBuildFailure, parseBaseImages } from "../baseimages.ts";
 import { detectTarget } from "../compose.ts";
 import { readGitContext, sanitizeName } from "../git.ts";
 import { requireRuntime, requireUpload } from "../runtime.ts";
@@ -117,6 +119,15 @@ export function createBuildTool(): ToolDefinition<typeof parameters> {
 					},
 				});
 
+				// --- Pre-pull base images ---------------------------------------------
+				// Arcane's builder cannot reach a registry on its own; see baseimages.ts.
+				const baseImages = await readBaseImages(contextRoot, dockerfile, params.build_args);
+				const pullReport = await ensureBaseImages(client, environmentId, baseImages, {
+					signal,
+					onProgress: (message) =>
+						onUpdate?.({ content: [{ type: "text", text: message }], details: {} }),
+				});
+
 				onUpdate?.({
 					content: [
 						{
@@ -176,6 +187,8 @@ export function createBuildTool(): ToolDefinition<typeof parameters> {
 					failed ? "Image build FAILED." : "Image build finished.",
 					summary,
 					record?.errorMessage ? `error: ${record.errorMessage}` : "",
+					explainBuildFailure(output, pullReport) ?? "",
+					...pullReport.failed.map((f) => `warning: could not pull ${f.image}: ${f.error}`),
 					...result.warnings.map((w) => `warning: ${w}`),
 					"",
 					"BuildKit output:",
@@ -195,4 +208,22 @@ export function createBuildTool(): ToolDefinition<typeof parameters> {
 			}
 		},
 	});
+}
+
+/**
+ * Read the Dockerfile from the local tree to find its base images. Unreadable
+ * means no pre-pull, not a failure: the build reports a missing Dockerfile far
+ * better than this can.
+ */
+export async function readBaseImages(
+	contextRoot: string,
+	dockerfile: string,
+	buildArgs?: Record<string, string>,
+): Promise<string[]> {
+	try {
+		const content = await readFile(join(contextRoot, dockerfile), "utf8");
+		return parseBaseImages(content, buildArgs);
+	} catch {
+		return [];
+	}
 }

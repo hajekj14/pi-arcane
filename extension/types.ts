@@ -199,6 +199,17 @@ export interface BuildRequest {
 	provider?: string;
 }
 
+export interface ImageSummary {
+	id: string;
+	repoTags?: string[] | null;
+	repoDigests?: string[] | null;
+	created?: number;
+	size?: number;
+	inUse?: boolean;
+	repo?: string;
+	tag?: string;
+}
+
 export interface ImageBuildRecord {
 	id: string;
 	environmentId: string;

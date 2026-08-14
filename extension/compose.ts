@@ -294,6 +294,62 @@ export function prepareCompose(
 	};
 }
 
+export interface BuildDirective {
+	service: string;
+	/** Context as written in the compose file, relative unless it was absolute. */
+	context: string;
+	/** Dockerfile path relative to the context. Defaults to `Dockerfile`. */
+	dockerfile: string;
+	args: Record<string, string>;
+}
+
+/**
+ * Every service that builds rather than pulling, with enough detail to find its
+ * Dockerfile on disk. Used to pre-pull base images before compose builds them.
+ */
+export function readBuildDirectives(content: string): BuildDirective[] {
+	const doc = parseCompose(content);
+	const directives: BuildDirective[] = [];
+
+	for (const [service, raw] of Object.entries(doc.services ?? {})) {
+		const build = ((raw ?? {}) as ComposeService).build;
+		if (build === undefined) continue;
+
+		if (typeof build === "string") {
+			directives.push({ service, context: build, dockerfile: "Dockerfile", args: {} });
+			continue;
+		}
+		if (typeof build !== "object" || build === null) continue;
+
+		const object = build as Record<string, unknown>;
+		directives.push({
+			service,
+			context: typeof object.context === "string" ? object.context : ".",
+			dockerfile: typeof object.dockerfile === "string" ? object.dockerfile : "Dockerfile",
+			args: readBuildArgs(object.args),
+		});
+	}
+
+	return directives;
+}
+
+/** compose accepts build args as a mapping or as a `KEY=value` list. */
+function readBuildArgs(value: unknown): Record<string, string> {
+	const args: Record<string, string> = {};
+	if (Array.isArray(value)) {
+		for (const entry of value) {
+			if (typeof entry !== "string") continue;
+			const eq = entry.indexOf("=");
+			if (eq > 0) args[entry.slice(0, eq)] = entry.slice(eq + 1);
+		}
+	} else if (value && typeof value === "object") {
+		for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+			if (raw !== null && raw !== undefined) args[key] = String(raw);
+		}
+	}
+	return args;
+}
+
 export interface RewriteResult {
 	content: string;
 	/** Services whose build context was repointed. */

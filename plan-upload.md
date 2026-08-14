@@ -399,6 +399,39 @@ PUT https://pi-5559.hajek.click/files/<slug>/ctx/src/index.ts?overwrite=true
 The manifest from §3.4 moves to `/files/<slug>/manifest.json` (still outside `ctx/`) and is read back
 with an authenticated `GET`, which is faster and simpler than Arcane's `browse/content`.
 
+### 7.5 Arcane's builder has no registry session
+
+Independent of upload, and worth recording because the error names neither cause nor fix:
+
+```
+failed to resolve source metadata for docker.io/library/nginx:1.27-alpine: no active sessions
+```
+
+Arcane invokes BuildKit without an attached client session, so BuildKit cannot talk to a registry.
+**Only base images already in the host's image store resolve.** Measured on 2026-08-14:
+
+| Case | Result |
+| --- | --- |
+| `FROM nginx:alpine` (on the host) | builds |
+| `FROM nginx:1.27-alpine` (absent) | `no active sessions` |
+| same build after `POST /images/pull` | builds |
+| `pull: true` on the build request | no effect |
+| `provider: docker` / `classic` / `buildkit` | `unknown build provider` — no override exists |
+| compose path (`up` builds the service) | fails identically |
+
+It looks intermittent only because it depends on what happens to be cached: the first `alpine:3.20`
+probe failed for this reason, then `nginx:alpine` succeeded and hid it.
+
+Worked around in [extension/baseimages.ts](extension/baseimages.ts): before any build, the
+Dockerfile's `FROM` and `COPY --from=` images are parsed (handling `--platform`, `AS` stages, stage
+references, `scratch`, and `ARG` interpolation) and any that are missing are pulled through Arcane's
+own `POST /images/pull`, which does have credentials. Both paths do this — the compose path reads
+each building service's Dockerfile via `readBuildDirectives`. A build that fails anyway gets the
+explanation appended rather than the bare BuildKit line.
+
+The real fix belongs in Arcane: attach a session (or an auth provider) to its BuildKit client. Worth
+reporting upstream — until then every Arcane build is limited to cached base images.
+
 ### 7.4 Impact on the plan
 
 - §3.2 target resolution gains a **first** branch: if `upload.url` + `upload.token` are configured,

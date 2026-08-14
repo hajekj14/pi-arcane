@@ -10,9 +10,11 @@ import assert from "node:assert/strict";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import arcaneExtension from "../extension/index.ts";
+import { parseBaseImages } from "../extension/baseimages.ts";
 import {
 	generateCompose,
 	prepareCompose,
+	readBuildDirectives,
 	readComposeInfo,
 	rewriteBuildContexts,
 } from "../extension/compose.ts";
@@ -188,6 +190,77 @@ const generated = generateCompose({ serviceName: "web", image: "app:main" });
 const generatedInfo = readComposeInfo(generated);
 assert.equal(generatedInfo.primaryService?.image, "app:main");
 assert.deepEqual(generatedInfo.primaryService?.publishedPorts, [{ host: "5553", container: "80" }]);
+
+// --- base images ------------------------------------------------------------
+// Arcane's builder cannot fetch base images itself ("no active sessions"), so
+// every external image a Dockerfile needs must be found and pulled first.
+// Missing one turns into a confusing build failure, hence the detail here.
+{
+	assert.deepEqual(parseBaseImages("FROM nginx:1.27-alpine\n"), ["nginx:1.27-alpine"]);
+
+	assert.deepEqual(
+		parseBaseImages("FROM --platform=$BUILDPLATFORM node:22-alpine AS build\nFROM nginx:alpine\nCOPY --from=build /app /srv\n"),
+		["node:22-alpine", "nginx:alpine"],
+		"flags are skipped, stages are not mistaken for images",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("FROM scratch\n"),
+		[],
+		"scratch is not a registry image",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("FROM alpine AS a\nFROM alpine AS b\n"),
+		["alpine"],
+		"duplicates collapse",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("ARG NODE=node:22-alpine\nFROM $NODE\n"),
+		["node:22-alpine"],
+		"an ARG default before FROM is interpolated",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("ARG NODE=node:20\nFROM ${NODE}\n", { NODE: "node:22" }),
+		["node:22"],
+		"a passed build arg wins over the ARG default",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("FROM $UNSET_THING\n"),
+		[],
+		"an unresolved variable is left for the build to report",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("FROM alpine\nCOPY --from=0 /a /b\nCOPY --from=busybox:1.36 /c /d\n"),
+		["alpine", "busybox:1.36"],
+		"a numeric --from is a stage index; an image reference is not",
+	);
+
+	assert.deepEqual(
+		parseBaseImages("FROM \\\n  nginx:alpine\n"),
+		["nginx:alpine"],
+		"line continuations are joined",
+	);
+
+	assert.deepEqual(parseBaseImages("# FROM commented:out\nFROM alpine\n"), ["alpine"]);
+}
+
+// --- compose build directives -----------------------------------------------
+{
+	const directives = readBuildDirectives(
+		"services:\n  web:\n    build: ./web\n  api:\n    build:\n      context: ./api\n      dockerfile: Dockerfile.api\n      args:\n        - VERSION=1.2\n  db:\n    image: postgres\n",
+	);
+	assert.deepEqual(
+		directives.map((d) => `${d.service}:${d.context}:${d.dockerfile}`),
+		["web:./web:Dockerfile", "api:./api:Dockerfile.api"],
+		"only building services are returned, with their Dockerfile paths",
+	);
+	assert.deepEqual(directives[1].args, { VERSION: "1.2" }, "list-form build args are read");
+}
 
 // --- public URLs -----------------------------------------------------------
 // Routing is port-encoded: pi-<hostPort>.hajek.click proxies to 127.0.0.1:<port>.

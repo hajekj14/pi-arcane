@@ -27,6 +27,7 @@ import {
 	type Environment,
 	type ErrorModel,
 	type ImageBuildRecord,
+	type ImageSummary,
 	type MessageResponse,
 	type ProjectDetails,
 	type UpdateProjectRequest,
@@ -465,6 +466,10 @@ export class ArcaneClient {
 		return this.requestAllPages<ImageBuildRecord>(`/environments/${enc(envId)}/images/builds`, {
 			signal,
 		});
+	}
+
+	listImages(envId: string, signal?: AbortSignal): Promise<ImageSummary[]> {
+		return this.requestAllPages<ImageSummary>(`/environments/${enc(envId)}/images`, { signal });
 	}
 
 	/**
