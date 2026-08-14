@@ -302,8 +302,12 @@ export async function writeConfigPatch(
 		...existing,
 		...patch,
 		defaults: { ...(existing.defaults ?? {}), ...(patch.defaults ?? {}) },
+		// Merged like defaults: patching just the URL must not drop a hand-written
+		// token, containerPath or volumeName.
+		upload: { ...(existing.upload ?? {}), ...(patch.upload ?? {}) },
 	};
 	if (Object.keys(merged.defaults ?? {}).length === 0) delete merged.defaults;
+	if (Object.keys(merged.upload ?? {}).length === 0) delete merged.upload;
 
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
