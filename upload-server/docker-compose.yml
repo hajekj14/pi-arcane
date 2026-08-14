@@ -1,0 +1,109 @@
+# pi-arcane upload sidecar
+#
+# Purpose: give the pi-arcane extension a fast way to push a working tree onto
+# the Arcane host so `POST /environments/{id}/images/build` can use it as
+# `contextDir`. See plan-upload.md §7.
+#
+# Image: mayth/simple-upload-server:v2 — Go, distroless/static, ~6 MB, MIT,
+# last released 2026-07. https://github.com/mayth/go-simple-upload-server
+#
+# Auth: the bearer token is the **Arcane API key**, so the extension carries a
+# single secret for both services. It is read from a JSON config file inside the
+# Arcane data volume rather than a CLI flag or an env var, so it does not show
+# up in `docker inspect`, in Arcane's container-details view, or in `ps` output
+# on the host. This compose file therefore contains no secret at all.
+#
+# ---------------------------------------------------------------------------
+# One-time setup of the config file (before the first `up`)
+# ---------------------------------------------------------------------------
+# Write it into the volume with Arcane's own API — no shell on the host needed.
+# It lands at /app/data/pi-arcane-upload.config.json, which this container sees
+# as /config/pi-arcane-upload.config.json:
+#
+#   cat > config.json <<EOF
+#   {
+#     "addr": "0.0.0.0:8080",
+#     "document_root": "/data/pi-arcane",
+#     "enable_auth": true,
+#     "read_write_tokens": ["<ARCANE_API_KEY>"],
+#     "max_upload_size": 268435456,
+#     "read_timeout": "300s",
+#     "write_timeout": "300s"
+#   }
+#   EOF
+#
+#   curl -X POST -H "X-API-Key: $ARCANE_API_KEY" -F file=@config.json \
+#     "https://arcane.hajek.click/api/environments/0/volumes/arcane_arcane-data/browse/upload?path=/" \
+#     # then rename/upload it as pi-arcane-upload.config.json
+#
+# The file lives OUTSIDE document_root on purpose — otherwise it would be
+# readable over HTTP at /files/... by anyone holding a token.
+#
+# Rotating the Arcane API key means rewriting this file and restarting the
+# container; the two are now the same credential.
+#
+# ---------------------------------------------------------------------------
+# Usage
+# ---------------------------------------------------------------------------
+#   PUT https://pump.hajek.click/files/<slug>/ctx/<path>?overwrite=true
+#   Authorization: Bearer $ARCANE_API_KEY
+#   Content-Type: multipart/form-data   (field name: "file")
+#
+# and the build sees that file at
+#
+#   /app/data/pi-arcane/<slug>/ctx/<path>
+#
+# because volume `arcane_arcane-data` is mounted at /app/data inside the Arcane
+# container. Parent directories are created automatically (MkdirAll).
+
+services:
+  upload:
+    image: mayth/simple-upload-server:v2
+    container_name: pi-arcane-upload
+    restart: unless-stopped
+
+    # Host port 5559. The public entry point is https://pump.hajek.click
+    # (nginx/pump.hajek.click.conf); the port also stays reachable through the
+    # wildcard pi-5559.hajek.click vhost.
+    ports:
+      - "5559:8080"
+
+    volumes:
+      # Upload target. document_root below confines the HTTP surface to the
+      # pi-arcane/ subtree, so the server cannot read or write arcane.db even
+      # though the whole volume is mounted here.
+      - arcane-data:/data
+      # Same volume, read-only, purely to reach the config file. Keeping it a
+      # separate read-only mount means a bug in the upload path cannot rewrite
+      # the token file.
+      - arcane-data:/config:ro
+
+    command:
+      - "-config"
+      - "/config/pi-arcane-upload.config.json"
+
+    read_only: true
+    # Go's multipart parser holds the first 32 MiB of a part in memory and
+    # spills the remainder to os.TempDir(). With a read-only root that fails
+    # mid-upload — `open /tmp/multipart-...: read-only file system`, a 500 after
+    # exactly ~32 MiB — so /tmp needs to be writable. Capped at 512 MiB so a
+    # large or concurrent upload cannot eat the host's RAM: an upload that
+    # exceeds it fails with ENOSPC instead. Files under 32 MiB never touch it.
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    # No healthcheck: the image is distroless (no shell, no curl). Liveness is
+    # visible from the outside via any authenticated request.
+
+volumes:
+  arcane-data:
+    external: true
+    name: arcane_arcane-data
+
+# ---------------------------------------------------------------------------
+# nginx
+# ---------------------------------------------------------------------------
+# See nginx/pump.hajek.click.conf. Both that vhost and the TLS-terminating
+# front VM need `client_max_body_size 256m;` to match -max_upload_size above;
+# nginx's 1 MB default is what returns 413 otherwise.
